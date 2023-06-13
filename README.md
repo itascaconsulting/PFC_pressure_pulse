@@ -3,6 +3,7 @@
 
 ![Fragment shapes resulting from loading at different peak pressures
 and rise times.](./results.png)
+
 Fragment shapes resulting from loading at different peak pressures
 and rise times.
 
