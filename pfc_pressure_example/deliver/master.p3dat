@@ -1,0 +1,11 @@
+; Running this file creates all the material specimens and runs all the cases described in the report
+new
+
+call coarse_box/myMatGen.p3dvr
+call parameter_study.py
+
+call cube/myMatGen.p3dvr
+call base3d.py
+
+call fine_box/myMatGen.p3dvr
+call base_fine.py

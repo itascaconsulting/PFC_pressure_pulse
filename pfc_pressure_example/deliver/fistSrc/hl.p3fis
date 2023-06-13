@@ -1,0 +1,164 @@
+;fname: hl.p3fis
+;
+; HilL material support functions.
+;
+;==================================================================================================
+def hl_cHill( cp )
+; Return true if cp is a hill contact.
+;
+  if contact.model(cp) == 'hill' then
+    hl_cHill = true
+  else
+    hl_cHill = false
+  end_if
+end
+;------------------------------------------------
+def hlm_checkParams
+  if hlm_youngMod == 0 then ; default
+    hlm_youngMod = float(0.0)
+  else
+    if hlm_youngMod < 0.0 then
+      util.error = 'hlm_youngMod must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if hlm_poisRatio == 0 then ; default
+    hlm_poisRatio = float(0.0)
+  else
+    if hlm_poisRatio <= -1.0 then
+      util.error = 'hlm_poisRatio must be in range (-1.0, 0.5].'
+    end_if
+    if hlm_poisRatio > 0.5 then
+      util.error = 'hlm_poisRatio must be in range (-1.0, 0.5].'
+    end_if
+  end_if
+  ;
+  if hlm_fricCoef == 0 then ; default
+    hlm_fricCoef = float(0.0)
+  else
+    if hlm_fricCoef < 0.0 then
+      util.error = 'hlm_fricCoef must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if hlm_dampCon == 0 then ; default
+    hlm_dampCon = float(0.0)
+  else
+    if hlm_dampCon < 0.0 then
+      util.error = 'hlm_dampCon must be in range [0.0, 1.0].'
+    end_if
+    if hlm_dampCon > 1.0 then
+      util.error = 'hlm_dampCon must be in range [0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  if hlm_suction == 0 then ; default
+    hlm_suction = float(0.0)
+  else
+    if hlm_suction < 0.0 then
+      util.error = 'hlm_suction must be greater than or equal to zero.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def hlm_listProps
+  io.out('   Hill material group:')
+  io.out('     hlm_youngMod (Young\'s modulus of grains): '  + string(hlm_youngMod))
+  io.out('     hlm_poisRatio (Poisson\'s ratio of grains): ' + string(hlm_poisRatio))
+  io.out('     hlm_fricCoef (friction coefficient): '        + string(hlm_fricCoef))
+  io.out('     hlm_dampCon (damping constant): '             + string(hlm_dampCon))
+  io.out('     hlm_suction (suction): '                      + string(hlm_suction))
+end
+;------------------------------------------------
+def hlm_computeMicroStrucProps
+; Compute the microstructural properties of the hill material and store in
+; global variables.
+;
+; OUT: mp_nHL{c, m{0,1,2}}  : see hlm_listMicroStrucProps
+;
+  mp_nHLc  = 0
+  mp_nHLms0 = 0
+  mp_nHLms1 = 0
+  mp_nHLms2 = 0
+  local cp
+  loop foreach cp contact.list.all
+    if hl_cHill(cp) then
+      if contact.active(cp) then
+        mp_nHLc = mp_nHLc + 1
+        if      contact.prop(cp, 'mois_state') == 0 then
+          mp_nHLms0 = mp_nHLms0 + 1
+        else if contact.prop(cp, 'mois_state') == 1 then
+          mp_nHLms1 = mp_nHLms1 + 1
+        else if contact.prop(cp, 'mois_state') == 2 then
+          mp_nHLms2 = mp_nHLms2 + 1
+        end_if
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def hlm_listMicroStrucProps
+  io.out('     mp_nHLc  (# active hill contacts, all are grain-grain): '+string(mp_nHLc))
+  local myStr
+  if hlm_mwCalled then
+    io.out('     The function hlm_makeWet was last called with parameters:')
+    io.out('       suction      = '+string(hlm_mwSuction))
+    io.out('       moisture gap = '+string(hlm_mwMoisGap))
+  else
+    io.out('     The function hlm_makeWet has not been called.')
+  end_if
+  io.out('     Moisture state of active hill contacts:')
+  io.out('       mp_nHLms0 (# dry):            '+string(mp_nHLms0))
+  io.out('       mp_nHLms1 (# dry & ruptured): '+string(mp_nHLms1))
+  io.out('       mp_nHLms2 (# wet):            '+string(mp_nHLms2))
+end
+;------------------------------------------------
+def hlm_setMatBehavior( cSet, prox )
+  local noFric = -99.0
+  ft_setMatBehavior( cSet, prox, noFric )
+end
+;------------------------------------------------
+def hlm_makeWet( psi, gm )
+; Add moisture to the hill material s.t. the wet hill contact model with suction psi will exist
+; between all grains that are within the moisture-gap distance of one another. This operation may
+; create new grain-grain contacts, and such contacts will be assigned the wet hill contact model
+; with suction psi. [The new grain-grain contacts are created between grains that are within the
+; moisture-gap distance of one another. Note that there are many grains in a typical granular
+; assembly that are near to one another, but contacts may not exist between all of these near-
+; neighbor pairs.] A side effect of this function is that the global suction variable (hlm_suction)
+; will be set to psi.
+;
+; PARAMS:
+;   psi : suction
+;   gm  : moisture gap
+;
+; OUT: hlm_suction
+;      hlm_mw{Called, Suction, MoisGap}
+;
+  hlm_mwCalled = true
+  hlm_mwSuction = psi
+  hlm_mwMoisGap = gm
+  ;
+  ; *** (1) Set suction (and all other hill properties) for existing grain-grain contacts,
+  ;     (2) create contacts between all grains within gm of one another,
+  ;     (3) make all grain-grain contacts within gm of one another wet, and
+  ;     (4) return proximity to zero for future contacts.
+  hlm_suction = psi
+  local noProx = -99.0
+  hlm_setMatBehavior( 'existing', noProx ) ; (1)
+  hlm_setMatBehavior(   'future',     gm ) ; (2)
+  command
+    contact method make_wet gap [gm]       ; (3)
+  end_command
+  hlm_setMatBehavior(   'future',    0.0 ) ; (4)
+end
+;------------------------------------------------
+def hlm_makeDry
+; Remove all moisture from the hill material. All hill contacts will have a moisture state of dry.
+;
+  command
+    contact method make_dry
+  end_command
+end
+return
+;EOF: hl.p3fis

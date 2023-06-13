@@ -1,0 +1,276 @@
+;fname: tt.fis
+;
+; direct-Tension Test support functions.
+;
+;==================================================================================================
+;************************************************
+; Direct-Tension Test Parameters:
+;
+;   tt_tg         : grip thickness
+;   tt_eRate      : axial strain rate w.r.t. matVessel height
+;                   (|v| = 0.5 * tt_eRate * H, tt_eRate > 0, v is loadVel, H is spec. height)
+;   tt_loadCode   : loading-phase code (0: single stage, 1: multiple stages)
+;   if tt_loadCode == 0:
+;     tt_loadFac  : load-termination factor for termination criterion:
+;                    |x| <= tt_loadFac*|x|_max, where x = mv_msa
+;
+;   Set these parameters in ttSetParams in files ttParams.p{2,3}dat.
+;
+;   Internal parameters:
+;     tt_loadStage : completed load stage {0,1,...}
+;                      (e.g., at end of first load stage, tt_loadStage is one)
+;     tt_msaMax    : maximum of {absolute value of {mv_msa}}
+;     tt_msaMax0   : value of tt_msaMax at start of loading phase
+;------------------------------------------------
+def _ttCheckParams
+  if tt_tg == 0 then ; default
+    tt_tg = 0.1 * mv_H
+  else
+    if tt_tg <= 0.0 then
+      util.error = 'tt_tg must be greater than zero.'
+    end_if
+  end_if
+  if tt_eRate == 0 then ; default
+    util.error = 'tt_eRate must be specified.'
+  else
+    if tt_eRate <= 0.0 then
+      util.error = 'tt_eRate must be greater than zero.'
+    end_if
+  end_if
+  if tt_loadCode # 0 then
+    if tt_loadCode # 1 then
+      util.error = 'tt_loadCode must be {0,1}.'
+    end_if
+  end_if
+  if tt_loadCode == 0 then
+    if tt_loadFac == 0 then ;default
+      tt_loadFac = 0.9
+    else
+      if tt_loadFac <= 0.0 then
+        util.error = 'tt_loadFac must be greater than zero.'
+      end_if
+    end_if
+  end_if
+end
+;------------------------------------------------
+def ttListProps
+  io.out('## Direct-Tension Test Properties:')
+  ;
+  io.out('     tt_tg (grip thickness): '+string(tt_tg))
+  io.out('     tt_eRate (axial strain rate, positive value): '+string(tt_eRate))
+    local myStr = '     tt_loadCode (loading-phase code): '+string(tt_loadCode)
+    if tt_loadCode == 0 then
+      myStr = myStr + ' (single stage)'
+    else ; tt_loadCode == 1
+      myStr = myStr + ' (multiple stages, specify in function ttPerformStages)'
+    end_if
+  io.out( myStr )
+  if tt_loadCode == 0 then
+    io.out('     tt_loadFac (load-termination factor): '+string(tt_loadFac))
+  end_if
+end
+;************************************************
+def ttSetupPhase
+; Perform set-up phase by identifying the grip grains (by assigning the names ttGripTop and ttGripBottom
+; to the first slot of the group data for these grains and ttGripNot for all other grains), specifying
+; the motion of these grains (setting velocity and spin to zero, and fixing all DOFs) and
+; zeroing the strains.
+;
+; IN:  tt_tg, mv_H
+; OUT: Saved State (with corresponding model title):
+;        <cm_matName>-tt0 : end of loading stage 0
+;
+  io.out('## ttSetupPhase (entering).')
+  tt_loadStage = -1
+  ft_SetTitle( _ttMatTestStr + ', performing set-up phase (load stage 0). . .' )
+  ;
+  local MinTop =  0.5*mv_H - tt_tg
+  local MaxTop =  0.5*mv_H + tt_tg
+  local MinBot = -0.5*mv_H - tt_tg
+  local MaxBot = -0.5*mv_H + tt_tg
+  command
+    ball group ttGripNot slot 1
+  end_command
+  if global.dim == 3 then
+    command
+      ball group ttGripTop    slot 1 range z [MinTop] [MaxTop]
+      ball group ttGripBottom slot 1 range z [MinBot] [MaxBot]
+      ball attribute velocity (0.0,0.0,0.0) spin (0.0,0.0,0.0) ...
+                     range group ttGripTop any group ttGripBottom any
+    end_command
+  else ; 2D model
+    command
+      ball group ttGripTop    slot 1 range y [MinTop] [MaxTop]
+      ball group ttGripBottom slot 1 range y [MinBot] [MaxBot]
+      ball attribute velocity (0.0,0.0) spin 0.0 ...
+                     range group ttGripTop any group ttGripBottom any
+    end_command
+  end_if
+  command
+    ball fix       velocity               spin ...
+                   range group ttGripTop any group ttGripBottom any
+  end_command
+  ;
+  mv_mStrainZero
+  _ttEndStage
+  io.out('## ttSetupPhase (exiting).')
+end
+;------------------------------------------------
+def ttLoadingPhase
+; Perform loading phase by applying axial strain.
+;
+; IN:  tt_eRate
+; OUT: Saved States (with corresponding model titles):
+;        <cm_matName>-ttN : end of loading stage N, N = {1,2,...}
+;
+  io.out('## ttLoadingPhase (entering).')
+  if tt_loadCode == 0 then
+    _ttPerformStage( 1, 1.0 )  ; second param. specified axial-strain direc. only
+  else
+    ttPerformStages ; provided by user, in ttParams.p{2,3}dat
+  end_if
+  io.out('## ttLoadingPhase (exiting).')
+end
+;------------------------------------------------
+def ttPerformStages
+; If tt_loadCode == 1 then
+;   specify axial-strain increments for each loading stage via repeated calls to
+;   function _ttPerformStage, which has parameters:
+;     loadStage (loading stage to perform [1,2,...]), and
+;     e_incr    (axial strain increment [e_incr > 0 is opening]).
+; For example, to perform two stages:
+;   _ttPerformStage( 1,  0.008 ) ;  0.8% axial strain
+;   _ttPerformStage( 2, -0.005 ) ; -0.5% axial strain
+;
+  local myStr =         'The FISH function ttPerformStages must be provided by user'
+        myStr = myStr + ' when tt_loadCode == 1. This may be done by redefining the function'
+        myStr = myStr + ' in ttParams.p{2,3}dat.'
+  util.error = myStr
+end
+;------------------------------------------------
+def _ttPerformStage( loadStage, e_incr )
+; Perform specified loading stage.
+; Confirm that each load stage is being performed in consecutive order.
+; PARAMS:
+;   loadStage : loading stage to perform (1,2,...)
+;   e_incr    : axial strain increment (e_incr > 0 is opening)
+;
+  if loadStage # (tt_loadStage + 1) then
+    local myStr = '_ttPerformStage: Must specify load stages in consecutive order,'
+          myStr = myStr + ' completed load stage: '+string(tt_loadStage)
+          myStr = myStr + ', specified load stage: '+string(loadStage)+'.'
+    util.error = myStr
+  end_if
+  ft_SetTitle( _ttMatTestStr + ', performing load stage ' + string(loadStage) + '. . .' )
+  _ttApplyAxialStrain( e_incr )
+  _ttEndStage
+end
+;------------------------------------------------
+def _ttEndStage
+; IN/OUT: tt_loadStage
+  tt_loadStage = tt_loadStage + 1
+  ft_SetTitle( _ttMatTestStr + ', end of load stage ' + string(tt_loadStage) + '.' )
+  ;
+  ckForceUpdate
+  msForceUpdate
+  ft_SaveState( cm_matName, 'tt' + string(tt_loadStage) )
+end
+;------------------------------------------------
+def _ttMatTestStr
+  _ttMatTestStr = cm_matName + ' material, ' + _ttTestStr
+end
+;------------------------------------------------
+def _ttTestStr
+  local str = 'Direct-tension test'
+        str = str + ' (eRate = ' + string(tt_eRate) + ' s^-1)'
+  _ttTestStr = str
+end
+;------------------------------------------------
+def _ttApplyAxialStrain( e_incr )
+; Apply axial strain to the specimen by moving the grip grains (at tt_eRate) until either:
+;   the load-termination criterion is met (tt_loadCode = 0, tt_loadFac used) or
+;   the strain increment has been applied (tt_loadCode = 1, e_incr used).
+; Set grip-grain velocities to zero at end of strain application.
+; There is no acceleration stage. The measurement-based axial strain is used.
+; PARAMS:
+;   e_incr    : defined in _ttPerformStage
+; IN: tt_eRate, tt_loadCode, tt_loadFac
+;     mv_H
+;
+  io.out('** _ttApplyAxialStrain (entering) with')
+  io.out('     tt_loadCode = '+string(tt_loadCode))
+  if tt_loadCode == 0 then
+    io.out('     tt_loadFac (load-termination factor): '+string(tt_loadFac))
+  else ; tt_loadCode = 1
+    io.out('     e_incr (axial strain increment, e_incr > 0 is opening): '+string(e_incr))
+  end_if
+  ;
+  local AxialVelocity = math.sgn(e_incr) * (0.5 * tt_eRate * mv_H)
+  _ttSetGripVel( AxialVelocity )
+  ;
+  if tt_loadCode == 0 then
+    tt_msaMax = -1.0e20
+    _ttUpdate_msaMax
+    tt_msaMax0 = tt_msaMax
+    command
+      set fish callback 42.11        _ttUpdate_msaMax ; after update of mv_mStress
+      solve fishhalt _aASTPPdone0 ;{i: mv_msa, tt_msaMax0}
+      solve fishhalt _aASTPPdone  ;{i: mv_msa, tt_loadFac, tt_msaMax}
+      set fish callback 42.11 remove _ttUpdate_msaMax
+    end_command
+  else ; tt_loadCode = 1
+    _aASmea0  = mv_mea
+    _aASeincr = e_incr
+    command
+      solve fishhalt _aASdone ;{i: mv_mea, _aASmea0, _aASeincr}
+    end_command
+  end_if
+  ;
+  _ttSetGripVel( 0.0 )
+  io.out('** _ttApplyAxialStrain (exiting).')
+end
+;------------------------------------------------
+def _ttSetGripVel( gripVel )
+; Set axial velocity of the grip grains (with positive gripVel indicating opening motion).
+  if global.dim == 3 then
+    command
+      ball attribute zvelocity [ 1.0*gripVel] range group ttGripTop
+      ball attribute zvelocity [-1.0*gripVel] range group ttGripBottom
+    end_command
+  else ; 2D model
+    command
+      ball attribute yvelocity [ 1.0*gripVel] range group ttGripTop
+      ball attribute yvelocity [-1.0*gripVel] range group ttGripBottom
+    end_command
+  end_if
+end
+;------------------------------------------------
+def _aASdone ;{i: mv_mea, _aASmea0, _aASeincr}
+  if math.abs( mv_mea - _aASmea0 ) >= math.abs(_aASeincr) then
+    _aASdone = 1
+  else
+    _aASdone = 0
+  end_if
+end
+;------------------------------------------------
+def _ttUpdate_msaMax
+  tt_msaMax = math.max( math.abs(mv_msa), tt_msaMax )
+end
+;------------------------------------------------
+def _aASTPPdone ;{i: mv_msa, tt_loadFac, tt_msaMax}
+  if math.abs( mv_msa ) <= (tt_loadFac * tt_msaMax) then
+    _aASTPPdone = 1
+  else
+    _aASTPPdone = 0
+  end_if
+end
+;------------------------------------------------
+def _aASTPPdone0 ;{i: mv_msa, tt_msaMax0}
+  if math.abs( mv_msa ) > tt_msaMax0 then
+    _aASTPPdone0 = 1
+  else
+    _aASTPPdone0 = 0
+  end_if
+end
+return
+;EOF: tt.fis

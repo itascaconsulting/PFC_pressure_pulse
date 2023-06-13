@@ -1,0 +1,4677 @@
+;fname: ft.fis
+;
+; FishTank support functions.
+;
+;==================================================================================================
+;************************************************
+; Material-Vessel Parameters:
+;
+;   mv_type      : vessel-type code {0,1} = {physical, periodic}
+;   mv_shape     : vessel-shape code {0,1,2} = {rectangular cuboid, cylinder, sphere}
+;                  [2D model: mv_shape = 0]
+;   mv_{H,W,D}   : {Height, Width, Depth} = | {z,y,x }-directions, 3D model
+;                                           | {y,x,NA}-directions, 2D model
+;                                           | sphere diameter is mv_H
+;                  Height is axial direction
+;                  [2D model: mv_D is unit-thickness, not used]
+;   mv_expandFac     : expansion factor of physical vessel
+;   mv_inset{L,D}Fac : inset factors of measurement regions
+;                      Spanning length is mv_insetLFac times largest vessel dimenion, and
+;                      measRegionDiam  is mv_insetDFac times smallest vessel dimension.
+;   mv_emod      : effective modulus of physical vessel
+;
+;   Hidden parameters:
+;     _mvCylRes : cylinder resolution (cylindrical vessel only, 3D model)
+;                 Controls number of sides of circular cross section s.t. the side length is
+;                 smaller than _mvCylRes times cylinder radius.
+;                 Approximate mapping between resolution and number of sides:
+;                   n_sides = (2.0 * math.pi) / _mvCylRes
+;                   {4, 1.6}, {6, 1.2}, {8, 0.8}, {10, 0.68}, {12, 0.55}, {16, 0.4}
+;     _mvSphRes : sphere resolution (spherical vessel only, 3D model)
+;                 See approximate mapping for _mvCylRes
+;
+;   Set these parameters in mvSetParams in files mvParams.p{2,3}dat.
+;   Material vessel is made by function mvMake.
+;   Check/list all material-vessel parameters in _mvCheckParams/mvListProps.
+;
+;************************************************
+; Material Vessel (Stress, Strain and Porosity Quantities):
+;
+;   Measurement-based (mv_msX, mv_meX):
+;     mv_ms{xx,yy,zz,xy,xz,yz} : stress (symmetric, global system)
+;                                [2D model: mv_ms{zz,xz,yz} = 0]
+;     mv_me{xx,yy,zz,xy,xz,yz} : strain (symmetric, global system)
+;                                [2D model: mv_me{zz,xz,yz} = 0]
+;     mv_ms{a,r} : axial & radial stress
+;     mv_me{a,r} : axial & radial strain
+;     mv_msd     : deviatoric stress
+;     mv_msm     : mean stress
+;     mv_med     : deviatoric strain
+;     mv_mev     : volumetric strain
+;     mv_mn      : porosity
+;
+;     These quantities are the average values from three measurement regions (MRs).
+;     These quantities are computed by mv_mStress and mv_mStrain, initialized by mv_mInit, and
+;     zeroed by mv_mStressZero and mv_mStrainZero. The MRs are removed by mv_mRemove.
+;
+;   Wall-based (mv_wsX, mv_weX):
+;     mv_wAreaMode   : wall-based areas from {0: current, 1: initial} vessel dimensions, default: 0
+;     mv_ws{x,y,z}   : direct stresses (global system), force divided by wall-based areas
+;                      [2D model: mv_wsz = 0]
+;     mv_we{x,y,z}   : direct strains (global system)
+;                      [2D model: mv_wez = 0]
+;     mv_wP{x,y,z,r} : pressure on opposing walls in k-direc. (k = {x,y,z,r}), P > 0 is compression
+;                      [2D model: mv_wP{z,r} = 0]
+;     mv_ws{a,r} : axial & radial stress
+;     mv_we{a,r} : axial & radial strain
+;     mv_wsd     : deviatoric stress
+;     mv_wsm     : mean stress
+;     mv_wed     : deviatoric strain
+;     mv_wev     : volumetric strain
+;     _wA{x,y,z,r}  : wall-based areas (updated by _mv_wAreas, called only from mv_wStrain):
+;                       _wA{x,y,z} is total platen area perpendicular to {x,y,z}-direc.
+;                       _wAr is lateral surface area
+;     _wd{x,y,z,r}  : distance btn. opposing walls in {x,y,z,r} direc.
+;                     [2D model: _wd{z,r} = 0]
+;     _wd{x,y,z,r}0 : initial distance btn. opposing walls in {x,y,z,r} direc.
+;                     [2D model: _wd{z,r}0 = 0]
+;     mv_wn      : porosity (neglects overlaps)
+;
+;     These quantities are computed by mv_wStress and mv_wStrain, initialized by mv_wInit, and
+;     zeroed by mv_wStressZero and mv_wStrainZero (which updates the reference dimensions to
+;     equal the current dimensions). The wall-based mechanism is removed by mv_wRemove.
+;
+;************************************************
+; Servomechanism (SM)
+;
+;   SM Parameters:
+;     mvs_BC{x,y,z,r}    : boundary-condition code (0: velocity, 1: pressure)
+;                            velocityBC: velocity of wall pair is equal & opposite and
+;                                        velocity of cylindrical-wall vertices is radial
+;                                        (with positive velocity indicating opening motion)
+;                            pressureBC: velocity controlled by SCM to maintain pressure
+;                          [2D model: mvs_BC{z,r} not used]
+;     mvs_BC{x,y,z,r}Val : boundary-condition value (velocity or pressure, based on BC code)
+;                          [2D model: mvs_BC{z,r}Val not used]
+;     mvs_gainUpdateRate : servo gain update rate (number of cycles)
+;     mvs_vLimit         : limiting velocity (|v| <= vLimit, vLimit > 0)
+;                            Always enforced, even for velocityBC.
+;                            For pressureBC, used if gain is not adequate (KnSum is zero or
+;                            gain gives excessive velocity).
+;
+;   When the SM is on, it enforces the BCs during cycling.
+;   The SM is turned on by mvs_on, and turned off by mvs_off.
+;   Each direction has its own servo gain, which is updated when mvs_on is called,
+;   and thereafter at the specified rate (mvs_gainUpdateRate).
+;   The BCs are set by mvs_setBCs, which may be called multiple times.
+;   Static-equilibrium is enforced by mvs_eqP() and ft_eq().
+;   Confinement application is provided by mvs_applyConfinement().
+;   Radial velocity of cylinder- and sphere-wall vertices is stored in _mvsRadVel, and
+;   diameter of cylinder- and sphere-wall is updated by _mvsUpdateRadDiam.
+;
+;************************************************
+; Check/list all material-related parameters in _mpCheckAllParams/mpListMicroProps.
+; -----------------------------------------------
+; Common Parameters:
+;
+;   cm_matName      : material name
+;   cm_matType      : material-type code [0,4] = {linear,
+;                                                 contact-bonded, parallel-bonded, flat-jointed,
+;                                                 user-defined}
+;   cm_localDampFac : local-damping factor
+;   cm_densityCode  : density code (Crho, 0: grain, 1: bulk)
+;   cm_densityVal   : density value (rhoV, set density of each grain equal to:
+;                      rhoV (if Crho = 0)
+;                      rhoV * Vv / Vg, where Vv is volume of vessel, and
+;                                            Vg is total volume of grains)
+;
+;   Grain shape & size distribution group:
+;     cm_shape       : grain-shape code {0,1} = {all balls, all clumps}
+;     cm_nSD         : number of size distributions
+;     cm_typeSD(nSD) : size-distribution type {0,1} = {uniform, gaussian}
+;     cm_ctName(nSD) : clump-template name (cm_shape = 1)
+;     cm_Dlo(nSD)    : diameter range (lower)
+;     cm_Dup(nSD)    : diameter range (upper)
+;     cm_Vfrac(nSD)  : volume fraction
+;     cm_Dmult       : diameter multiplier (shifts the size distributions)
+;
+;   Set these parameters in mpSetCommonParams in files mpParams.p{2,3}dat.
+;************************************************
+; Packing Parameters:
+;
+;   pk_seed      : seed of random-number generator (affects packing)
+;   pk_Pm        : material pressure
+;   pk_PTol      : pressure tolerance
+;   pk_ARatLimit : equil-ratio limit (parameter of ft_eq)
+;   pk_stepLimit : step limit (parameter of ft_eq)
+;   pk_procCode  : packing-procedure code (0: boundary contraction, 1: grain scaling)
+;   pk_nc        : grain-cloud porosity
+;   Boundary-contraction group (pk_procCode = 0):
+;     pk_fricCA : material friction coef. during confinement application (CA)
+;     pk_vLimit : servo velocity limit during CA (see mvs_vLimit)
+;
+;   Hidden parameters:
+;     _pkORmaxLimit   - overlap-ratio maximum limit (used by _mpPackIsoState)
+;     _pkORupdateRate - overlap-ratio update rate (number of cycles), uses _pkORcnt
+;
+;   Set these parameters in mpSetPackingParams in files mpParams.p{2,3}dat.
+;************************************************
+; Linear Material Parameters:
+;
+;   Common group (see above)
+;   Packing group (see above)
+;   Linear material group:
+;     lnm_emod : effective modulus
+;     lnm_krat : stiffness ratio
+;     lnm_fric : friction coefficient
+;
+;   Set these parameters in mpSetLinParams in files mpParams.p{2,3}dat.
+;************************************************
+; Parallel-Bonded Material Parameters:
+;
+;   Common group (see above)
+;   Packing group (see above)
+;   Parallel-bonded material group:
+;     Linear group:
+;       pbm_emod : effective modulus
+;       pbm_krat : stiffness ratio
+;       pbm_fric : friction coefficient
+;
+;     Parallel-bond group:
+;       pbm_igap   : installation gap
+;       pbm_rmul   : radius multiplier
+;       pbm_bemod  : bond effective modulus
+;       pbm_bkrat  : bond stiffness ratio
+;       pbm_mcf    : moment-contribution factor
+;       pbm_ten_m  : tensile-strength distribution (mean)
+;       pbm_ten_sd : tensile-strength distribution (standard deviation)
+;       pbm_coh_m  : cohesion distribution (mean)
+;       pbm_coh_sd : cohesion distribution (standard deviation)
+;       pbm_fa     : friction angle (degrees)
+;
+;   Linear material group:
+;     lnm_emod : effective modulus
+;     lnm_krat : stiffness ratio
+;     lnm_fric : friction coefficient
+;
+;   Set these parameters in mpSetPBParams in files mpParams.p{2,3}dat.
+;************************************************
+; Contact-Bonded Material Parameters:
+;
+;   Common group (see above)
+;   Packing group (see above)
+;   Contact-bonded material group:
+;     Linear group:
+;       cbm_emod : effective modulus
+;       cbm_krat : stiffness ratio
+;       cbm_fric : friction coefficient
+;
+;     Contact-bond group:
+;       cbm_igap      : installation gap
+;       cbm_tens_m    : tensile-strength distribution [stress] (mean)
+;       cbm_tens_sd   : tensile-strength distribution [stress] (standard deviation)
+;       cbm_shears_m  : shear-strength   distribution [stress] (mean)
+;       cbm_shears_sd : shear-strength   distribution [stress] (standard deviation)
+;
+;   Linear material group:
+;     lnm_emod : effective modulus
+;     lnm_krat : stiffness ratio
+;     lnm_fric : friction coefficient
+;
+;   Set these parameters in mpSetCBParams in files mpParams.p{2,3}dat.
+;************************************************
+; Flat-Jointed Material Parameters:
+;
+;   Common group (see above)
+;   Packing group (see above)
+;   Flat-jointed material group:
+;     fjm_igap     : installation gap
+;     fjm_B_frac   : bonded fraction
+;     fjm_G_frac   : gapped fraction
+;     fjm_S_frac   : slit fraction (derived from fjm_B_frac and fjm_G_frac)
+;     fjm_G_m      : initial surface-gap distribution (mean)
+;     fjm_G_sd     : initial surface-gap distribution (standard deviation)
+;     fjm_Nr       : elements in radial direc.
+;                    [2D model: total number of elements]
+;     fjm_Nal      : elements in circumferential direc. (3D only)
+;     fjm_rmulCode : radius-multiplier code (0: fixed, 1: varying)
+;     fjm_rmulVal  : radius-multiplier value (fixed or starting)
+;     fjm_emod     : effective modulus
+;     fjm_krat     : stiffness ratio
+;     fjm_fric     : friction coefficient
+;     fjm_ten_m    : tensile-strength distribution (mean)
+;     fjm_ten_sd   : tensile-strength distribution (standard deviation)
+;     fjm_coh_m    : cohesion distribution (mean)
+;     fjm_coh_sd   : cohesion distribution (standard deviation)
+;     fjm_fa       : friction angle (degrees)
+;
+;   Linear material group:
+;     lnm_emod : effective modulus
+;     lnm_krat : stiffness ratio
+;     lnm_fric : friction coefficient
+;
+;   Set these parameters in mpSetFJParams in files mpParams.p{2,3}dat.
+;
+;************************************************
+def mvMake
+; Make the material vessel.
+;
+; IN:  Material-Vessel Parameters
+; OUT: mvWp{0,1}{x,y,z} : six axis-aligned wall pointers s.t. {0,1} = {-,+}
+;                                                             {x,y,z} = axis direction
+;                         [2D model: mvWp{0,1}z not used]
+;      mvWpCyl          : one z-aligned cylinder-wall pointer
+;                         [2D model: mvWpCyl not used]
+;      mvWpSph          : one sphere-wall pointer
+;      mvMp{1,2,3} : three measurement-region (MR) pointers
+;                    The MRs are placed symmetrically along the axis of the largest
+;                    vessel dimension (with a spanning length of mv_insetLFac times the largest
+;                    vessel dimension, and with a diameter of mv_insetDFac times the smallest
+;                    vessel dimension).
+;                    The MR-1 is at the origin, and MR-{2,3} are
+;                    positioned along the axis as:
+;                        2     1     3
+;                      --*-----*-----*-- ===> positive axis direc.
+;      _mvMpAxLen       : axial length spanned by measurement regions
+;      _mvMpRadLen{X,Y} : radial lengths in x & y direcs. spanned by measurement regions 
+;
+  ft_SetTitle( 'Making material vessel...' )
+  io.out('## mvMake, Make the material vessel (entering).')
+  if global.dim == 3 then
+    command
+      domain extent [-1.0*mv_D] [1.0*mv_D] ...
+                    [-1.0*mv_W] [1.0*mv_W] ...
+                    [-1.0*mv_H] [1.0*mv_H] ...
+             condition stop stop stop
+    end_command
+  else ; 2D model
+    command
+      domain extent [-1.0*mv_W] [1.0*mv_W] ...
+                    [-1.0*mv_H] [1.0*mv_H] ...
+             condition stop stop
+    end_command
+  end_if
+  ;
+  ft_setGrainWallBehavior( 'existing', 0.0, mv_emod, 0.0, 0.0, 'linear' )
+  ft_setGrainWallBehavior( 'future',   0.0, mv_emod, 0.0, 0.0, 'linear' )
+  _mvMakeWalls
+  _mvMakeMeasRegions
+  ;
+  ; Initialize the stress & strain measurement mechanisms.
+  mv_mInit
+  mv_wInit
+  ;
+  ; Monitor measure- and wall-based mean stress.
+  command
+    history nstep 20
+    history id=1 fish mv_msm
+    history id=2 fish mv_wsm
+    history id=3 fish mv_mn
+    history id=4 fish mv_wn
+  end_command
+  io.out('## mvMake (exiting).')
+end
+;------------------------------------------------
+def _mvMakeWalls
+  if mv_shape == 0 then ; rectangular cuboid
+    if global.dim == 3 then
+      command
+        wall generate id 1 name mv box [-0.5*mv_D*mv_expandFac] [0.5*mv_D*mv_expandFac] ...
+                                       [-0.5*mv_W*mv_expandFac] [0.5*mv_W*mv_expandFac] ...
+                                       [-0.5*mv_H*mv_expandFac] [0.5*mv_H*mv_expandFac]
+      end_command
+      mvWp0x = wall.find(3)
+      mvWp1x = wall.find(4)
+      mvWp0y = wall.find(5)
+      mvWp1y = wall.find(6)
+      mvWp0z = wall.find(1)
+      mvWp1z = wall.find(2)
+      ; Move walls to conform to material vessel dimensions.
+      wall.pos(mvWp0x, 1) = -0.5*mv_D
+      wall.pos(mvWp1x, 1) =  0.5*mv_D
+      wall.pos(mvWp0y, 2) = -0.5*mv_W
+      wall.pos(mvWp1y, 2) =  0.5*mv_W
+      wall.pos(mvWp0z, 3) = -0.5*mv_H
+      wall.pos(mvWp1z, 3) =  0.5*mv_H
+    else ; 2D model
+      command
+        wall generate id 1 name mv box [-0.5*mv_W*mv_expandFac] [0.5*mv_W*mv_expandFac] ...
+                                       [-0.5*mv_H*mv_expandFac] [0.5*mv_H*mv_expandFac]
+      end_command
+      mvWp0x = wall.find(4)
+      mvWp1x = wall.find(2)
+      mvWp0y = wall.find(1)
+      mvWp1y = wall.find(3)
+      ; Move walls to conform to material vessel dimensions.
+      wall.pos(mvWp0x, 1) = -0.5*mv_W
+      wall.pos(mvWp1x, 1) =  0.5*mv_W
+      wall.pos(mvWp0y, 2) = -0.5*mv_H
+      wall.pos(mvWp1y, 2) =  0.5*mv_H
+    end_if
+  else if mv_shape == 1 then ; cylinder
+    local cylRad = 0.5*mv_W
+    local cylRadEx = cylRad*mv_expandFac
+    command
+      wall generate id 1 name mvCyl cylinder axis [vector(0.0, 0.0, 1.0)]                    ...
+                                             base [vector(0.0, 0.0, -0.5*mv_H*mv_expandFac)] ...
+                                             height [mv_H*mv_expandFac]                      ...
+                                             radius [cylRad]                                 ...
+                                             cap no no                                       ...
+                                             resolution [_mvCylRes]
+      wall generate id 2 name mvBottom polygon [vector(-cylRadEx,-cylRadEx,-0.5*mv_H)] ...
+                                               [vector(-cylRadEx, cylRadEx,-0.5*mv_H)] ...
+                                               [vector( cylRadEx, cylRadEx,-0.5*mv_H)] ...
+                                               [vector( cylRadEx,-cylRadEx,-0.5*mv_H)] ...
+                                               makeplanar
+      wall generate id 3 name mvTop    polygon [vector(-cylRadEx,-cylRadEx, 0.5*mv_H)] ...
+                                               [vector(-cylRadEx, cylRadEx, 0.5*mv_H)] ...
+                                               [vector( cylRadEx, cylRadEx, 0.5*mv_H)] ...
+                                               [vector( cylRadEx,-cylRadEx, 0.5*mv_H)] ...
+                                               makeplanar
+    end_command
+    mvWpCyl = wall.find(1)
+    mvWp0z  = wall.find(2)
+    mvWp1z  = wall.find(3)
+  else ; mv_shape = 2 (sphere)
+    local sphRad = 0.5*mv_H
+    command
+      wall generate id 1 name mvSphere sphere position [vector(0.0, 0.0, 0.0)] ...
+                                              radius [sphRad]                  ...
+                                              resolution [_mvSphRes]
+    end_command
+    mvWpSph = wall.find(1)
+  end_if
+end
+;------------------------------------------------
+def _mvMakeMeasRegions
+; IN: mv_inset{L,D}Fac
+; OUT: mvMp{1,2,3}, _mvMpAxLen, _mvMpRadLen{X,Y} : see description in mvMake.
+;
+  local _Lmax = math.max(  mv_H, mv_W )
+  local _Lmin = math.min(  mv_H, mv_W )
+  if global.dim == 3 then
+    _Lmax = math.max( _Lmax, mv_D )
+    _Lmin = math.min( _Lmin, mv_D )
+  end_if
+  local _mvMpLength = mv_insetLFac * _Lmax
+  local _mvMpDiam   = mv_insetDFac * _Lmin
+  ;
+  ; 3D model: mv_shape=0: {H,W,D}  : {z,y,x}
+  ;           mv_shape=1: {H, W=D} : {z, y=x}
+  local _iHatMax
+  if global.dim == 3 then
+    if mv_H >= mv_W then
+      if mv_H >= mv_D then ; maxDir is z
+        _iHatMax = vector(0.0, 0.0, 1.0)
+        _mvMpAxLen   = _mvMpLength
+        _mvMpRadLenX = _mvMpDiam
+        _mvMpRadLenY = _mvMpDiam
+      end_if
+    end_if
+    if mv_W >= mv_D then
+      if mv_W >= mv_H then ; maxDir is y
+        _iHatMax = vector(0.0, 1.0, 0.0)
+        _mvMpAxLen   = _mvMpDiam
+        _mvMpRadLenX = _mvMpDiam
+        _mvMpRadLenY = _mvMpLength
+      end_if
+    end_if
+    if mv_D >= mv_H then
+      if mv_D >= mv_W then ; maxDir is x
+        _iHatMax = vector(1.0, 0.0, 0.0)
+        _mvMpAxLen   = _mvMpDiam
+        _mvMpRadLenX = _mvMpLength
+        _mvMpRadLenY = _mvMpDiam
+      end_if
+    end_if
+  else ; 2D model
+    if mv_H >= mv_W then ; maxDir is y
+      _iHatMax = vector(0.0, 1.0)
+      _mvMpAxLen   = _mvMpLength
+      _mvMpRadLenX = _mvMpDiam
+    else                 ; maxDir is x
+      _iHatMax = vector(1.0, 0.0)
+      _mvMpAxLen   = _mvMpDiam
+      _mvMpRadLenX = _mvMpLength
+    end_if
+  end_if
+  ;
+  local _mRad = 0.5 * _mvMpDiam
+  local _mPos
+  if global.dim == 3 then
+    _mPos = vector(0.0, 0.0, 0.0)
+  else ; 2D model
+    _mPos = vector(0.0, 0.0)
+  end_if
+  command
+    measure create id 1 radius @_mRad position @_mPos
+  end_command
+  local _mFac = (0.5 * _mvMpLength) - _mRad
+  _mPos = -_mFac * _iHatMax
+  command
+    measure create id 2 radius @_mRad position @_mPos
+  end_command
+  _mPos = _mFac * _iHatMax
+  command
+    measure create id 3 radius @_mRad position @_mPos
+  end_command
+  ;
+  mvMp1 = measure.find(1)
+  mvMp2 = measure.find(2)
+  mvMp3 = measure.find(3)
+end
+;------------------------------------------------
+def _mvVolume( initDim )
+; Return volume of material vessel. If [initDim] = true, then use initial dimensions,
+; otherwise, use current dimensions.
+;
+; IN: mv_shape, mv_{H,W,D}
+;
+  if initDim then
+    if mv_shape == 0 then
+      if global.dim == 3 then
+        _mvVolume = mv_H * mv_W * mv_D
+      else ; 2D model
+        _mvVolume = mv_H * mv_W
+      end_if
+    else if mv_shape == 1
+      _mvVolume = (0.25 * math.pi * mv_W * mv_W) * mv_H
+    else ; mv_shape == 2
+      _mvVolume = _ftOneSixth * math.pi * mv_H * mv_H * mv_H
+    end_if
+  else ; initDim = false, use current dimensions
+    local _wAreaMode = mv_wAreaMode
+    mv_wAreaMode = 0
+    _mv_wAreas
+      if mv_shape == 0 then
+        if global.dim == 3 then
+          _mvVolume = _wdx * _wdy * _wdz
+        else ; 2D model
+          _mvVolume = _wdx * _wdy
+        end_if
+      else if mv_shape == 1
+        _mvVolume = (0.25 * math.pi * _wdr * _wdr) * _wdz
+      else ; mv_shape == 2
+        _mvVolume = _ftOneSixth * math.pi * _wdr * _wdr * _wdr
+      end_if
+    mv_wAreaMode = _wAreaMode
+    _mv_wAreas
+  end_if
+end
+;------------------------------------------------
+def _mvCheckParams
+  case_of mv_type
+      util.error = 'mv_type must be {0,1}.'
+    case 0
+      ; empty
+    case 1
+      util.error = 'Periodic material vessel is not yet available.'
+  end_case
+  ;
+  if global.dim == 3 then
+    if mv_shape # 0 then
+      if mv_shape # 1 then
+        if mv_shape # 2 then
+          util.error = 'mv_shape must be {0,1,2}.'
+        end_if
+      end_if
+    end_if
+  else ; 2D model
+    mv_shape = 0
+  end_if
+  ;
+  if mv_shape == 1 then
+    mv_D = mv_W  ; mv_W defines cylinder diameter, but mv_D is used in making measure regions and
+                 ; generating grain cloud within the box of the {ball,clump} distribute command.
+    if _mvCylRes == 0 then ; default
+      _mvCylRes = 0.55 ; 12-sided polygon
+    end_if
+  else if mv_shape == 2 then
+    mv_W = mv_H
+    mv_D = mv_H
+    if _mvSphRes == 0 then ; default
+      _mvSphRes = 0.55 ; equator is 12-sided polygon
+    end_if
+  end_if
+  ;
+  if mv_H == 0 then ; default
+    util.error = 'mv_H must be specified.'
+  else
+    if mv_H <= 0.0 then
+      util.error = 'mv_H must be greater than zero.'
+    end_if
+  end_if
+  if mv_W == 0 then ; default
+    util.error = 'mv_W must be specified.'
+  else
+    if mv_W <= 0.0 then
+      util.error = 'mv_W must be greater than zero.'
+    end_if
+  end_if
+  if mv_shape == 0 then
+    if global.dim == 3 then
+      if mv_D == 0 then ; default
+        util.error = 'mv_D must be specified.'
+      else
+        if mv_D <= 0.0 then
+          util.error = 'mv_D must be greater than zero.'
+        end_if
+      end_if
+    else ; 2D model
+      mv_D = 1.0 ; unit-thickness disks, ALWAYS!
+    end_if
+  end_if
+  ;
+  if mv_expandFac == 0 then ; default
+    mv_expandFac = 1.2
+  else
+    if mv_expandFac < 1.0 then
+      util.error = 'mv_expandFac must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  if mv_emod == 0 then ; default
+    util.error = 'mv_emod must be specified.'
+  else
+    if mv_emod <= 0.0 then
+      util.error = 'mv_emod must be greater than zero.'
+    end_if
+  end_if
+  ;
+  if mv_insetLFac == 0 then ; default
+    mv_insetLFac = 0.8
+  else
+    if mv_insetLFac <= 0.0 then
+      util.error = 'mv_insetLFac must be greater than zero.'
+    end_if
+    if mv_insetLFac > 1.0 then
+      util.error = 'mv_insetLFac must be less than or equal to one.'
+    end_if
+  end_if
+  ;
+  if mv_insetDFac == 0 then ; default
+    mv_insetDFac = 0.8
+  else
+    if mv_insetDFac <= 0.0 then
+      util.error = 'mv_insetDFac must be greater than zero.'
+    end_if
+    if mv_insetDFac > 1.0 then
+      util.error = 'mv_insetDFac must be less than or equal to one.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def mvListProps
+  io.out('## Material-Vessel Properties:')
+  ;
+  local _str = '     mv_type: '+string(mv_type)
+  case_of mv_type
+      util.error = 'mv_type is not {0,1}.'
+    case 0
+      _str = _str + ' (physical)'
+    case 1
+      _str = _str + ' (periodic)'
+  end_case
+  io.out(_str)
+  ;
+  _str = '     mv_shape: '+string(mv_shape)
+  case_of mv_shape
+      util.error = 'mv_shape is not {0,1,2}.'
+    case 0
+      _str = _str + ' (rectangular cuboid)'
+    case 1
+      _str = _str + ' (cylinder, _mvCylRes: ' + string(_mvCylRes) + ')'
+    case 2
+      _str = _str + ' (sphere, _mvSphRes: ' + string(_mvSphRes) + ')'
+  end_case
+  io.out(_str)
+  ;
+  if global.dim == 3 then
+    if mv_shape == 0 then
+      _str = '     {mv_H, _wdz} (height {initial, current}, aligned with z-axis): {'
+      _str = _str + string(mv_H) + ',' + string(_wdz) + '}'
+      io.out( _str )
+      _str = '     {mv_W, _wdy} ( width {initial, current}, aligned with y-axis): {'
+      _str = _str + string(mv_W) + ',' + string(_wdy) + '}'
+      io.out( _str )
+      _str = '     {mv_D, _wdx} ( depth {initial, current}, aligned with x-axis): {'
+      _str = _str + string(mv_D) + ',' + string(_wdx) + '}'
+      io.out( _str )
+    else if mv_shape == 1 then
+      _str = '     {mv_H, _wdz} (height {initial, current}, aligned with z-axis): {'
+      _str = _str + string(mv_H) + ',' + string(_wdz) + '}'
+      io.out( _str )
+      _str = '     {mv_W, _wdr} (diameter {initial, current},  lies in xy-plane): {'
+      _str = _str + string(mv_W) + ',' + string(_wdr) + '}'
+      io.out( _str )
+    else ; mv_shape == 2
+      _str = '     {mv_H, _wdr} (diameter {initial, current}): {'
+      _str = _str + string(mv_H) + ',' + string(_wdr) + '}'
+      io.out( _str )
+    end_if
+  else ; 2D model
+    _str = '     {mv_H, _wdy} (height {initial, current}, aligned with y-axis): {'
+    _str = _str + string(mv_H) + ',' + string(_wdy) + '}'
+    io.out( _str )
+    _str = '     {mv_W, _wdx} ( width {initial, current}, aligned with x-axis): {'
+    _str = _str + string(mv_W) + ',' + string(_wdx) + '}'
+    io.out( _str )
+    io.out('     mv_D (depth,  aligned with z-axis): ' + string(mv_D))
+    io.out('       [2D model: unit-thickness disks, thus mv_D is always one.]')
+  end_if
+  io.out('     mv_expandFac: ' + string(mv_expandFac))
+  io.out('     mv_emod (effective modulus): ' + string(mv_emod))
+  io.out('     mv_insetLFac (measurement region spanning-length factor): ' + string(mv_insetLFac))
+  io.out('     mv_insetDFac (measurement region diameter factor): ' + string(mv_insetDFac))
+end
+;************************************************
+def mv_mInit
+  mv_mStressZero
+  mv_mStress
+  mv_mStrainZero
+  mv_mStrain
+  mv_mPoros
+  command
+    set fish callback 42.1  mv_mStress  ; after FDLaw (40.1 is not allowed)
+    set fish callback 10.10 mv_mStrain  ; after EOMs
+    set fish callback 10.10 mv_mPoros   ; after EOMs
+  end_command
+end
+;------------------------------------------------
+def mv_mRemove
+  mv_mStressZero
+  mv_mStrainZero
+  mv_mn = 0.0
+  command
+    set fish callback 42.1  remove mv_mStress
+    set fish callback 10.10 remove mv_mStrain
+    set fish callback 10.10 remove mv_mPoros
+  end_command
+  measure.delete( mvMp1 )
+  measure.delete( mvMp2 )
+  measure.delete( mvMp3 )
+end
+;------------------------------------------------
+def mv_mStressZero
+  mv_msxx = 0.0
+  mv_msyy = 0.0
+  mv_mszz = 0.0
+  mv_msxy = 0.0
+  mv_msxz = 0.0
+  mv_msyz = 0.0
+  ;
+  mv_msa = 0.0
+  mv_msr = 0.0
+  mv_msd = 0.0
+  mv_msm = 0.0
+end
+;------------------------------------------------
+def mv_mStrainZero
+  mv_mexx = 0.0
+  mv_meyy = 0.0
+  mv_mezz = 0.0
+  mv_mexy = 0.0
+  mv_mexz = 0.0
+  mv_meyz = 0.0
+  ;
+  mv_mea = 0.0
+  mv_mer = 0.0
+  mv_med = 0.0
+  mv_mev = 0.0
+end
+;------------------------------------------------
+def mv_mStress
+; Update the material vessel measurement-based stress quantities.
+; IN:  mvMp{1,2,3}
+; OUT: mv_msX      (defined above)
+;
+  local myTen1 = measure.stress(mvMp1) ; stress tensor (has been made symmetric)
+  local myTen2 = measure.stress(mvMp2)
+  local myTen3 = measure.stress(mvMp3)
+  mv_msxx = _ftOneThird * ( myTen1(1,1) + myTen2(1,1) + myTen3(1,1) )
+  mv_msyy = _ftOneThird * ( myTen1(2,2) + myTen2(2,2) + myTen3(2,2) )
+  mv_msxy = _ftOneThird * ( myTen1(1,2) + myTen2(1,2) + myTen3(1,2) )
+  if global.dim == 3 then
+    mv_mszz = _ftOneThird * ( myTen1(3,3) + myTen2(3,3) + myTen3(3,3) )
+    mv_msxz = _ftOneThird * ( myTen1(1,3) + myTen2(1,3) + myTen3(1,3) )
+    mv_msyz = _ftOneThird * ( myTen1(2,3) + myTen2(2,3) + myTen3(2,3) )
+  end_if
+  ;
+  if global.dim == 3 then
+    mv_msa = mv_mszz
+    mv_msr = 0.5 * (mv_msxx + mv_msyy)
+    mv_msm = _ftOneThird * (mv_msa + 2.0*mv_msr)
+  else ; 2D model
+    mv_msa = mv_msyy
+    mv_msr = mv_msxx
+    mv_msm = 0.5 * (mv_msa + mv_msr)
+  end_if
+  mv_msd = mv_msa - mv_msr
+end
+;------------------------------------------------
+def mv_mStrain
+; Update the material vessel measurement-based strain quantities.
+; IN:  mvMp{1,2,3}
+; OUT: mv_meX      (defined above)
+;
+  local myTen1 = measure.strainrate(mvMp1) ; strain-rate tensor (symmetric portion of VGT)
+  local myTen2 = measure.strainrate(mvMp2)
+  local myTen3 = measure.strainrate(mvMp3)
+  mv_mexx = mv_mexx + _ftOneThird * ( myTen1(1,1) + myTen2(1,1) + myTen3(1,1) ) * mech.timestep
+  mv_meyy = mv_meyy + _ftOneThird * ( myTen1(2,2) + myTen2(2,2) + myTen3(2,2) ) * mech.timestep
+  mv_mexy = mv_mexy + _ftOneThird * ( myTen1(1,2) + myTen2(1,2) + myTen3(1,2) ) * mech.timestep
+  if global.dim == 3 then
+    mv_mezz = mv_mezz + _ftOneThird * ( myTen1(3,3) + myTen2(3,3) + myTen3(3,3) ) * mech.timestep
+    mv_mexz = mv_mexz + _ftOneThird * ( myTen1(1,3) + myTen2(1,3) + myTen3(1,3) ) * mech.timestep
+    mv_meyz = mv_meyz + _ftOneThird * ( myTen1(2,3) + myTen2(2,3) + myTen3(2,3) ) * mech.timestep
+  end_if
+  ;
+  if global.dim == 3 then
+    mv_mea = mv_mezz
+    mv_mer = 0.5*( mv_mexx + mv_meyy )
+    mv_mev = mv_mea + 2.0*mv_mer
+  else ; 2D model
+    mv_mea = mv_meyy
+    mv_mer = mv_mexx
+    mv_mev = mv_mea + mv_mer
+  end_if
+  mv_med = mv_mea - mv_mer
+end
+;------------------------------------------------
+def mv_mPoros
+; Update the material vessel measurement-based porosity.
+; IN:  mvMp{1,2,3}
+; OUT: mv_mn (defined above)
+;
+  mv_mn = _ftOneThird * (   measure.porosity(mvMp1) ...
+                          + measure.porosity(mvMp2) ...
+                          + measure.porosity(mvMp3)     )
+end
+;------------------------------------------------
+def mv_wInit
+  if global.dim == 3 then
+    _wdx = mv_D
+    _wdy = mv_W
+    _wdz = mv_H
+    _wdr = mv_W
+  else ; 2D model
+    _wdx = mv_W
+    _wdy = mv_H
+  end_if
+  ;
+  mv_wStrainZero
+  mv_wStrain
+  mv_wStressZero
+  mv_wStress
+  mv_wPoros
+  command
+    set fish callback 42.1  mv_wStress  ; after FDLaw (40.1 is not allowed)
+    set fish callback 10.10 mv_wStrain  ; after EOMs
+    set fish callback 10.10 mv_wPoros   ; after EOMs
+  end_command
+end
+;------------------------------------------------
+def mv_wRemove
+  mv_wStrainZero
+  mv_wStressZero
+  command
+    set fish callback 42.1  remove mv_wStress
+    set fish callback 10.10 remove mv_wStrain
+    set fish callback 10.10 remove mv_wPoros
+  end_command
+  if mv_shape == 0 then
+    wall.delete( mvWp0x )
+    wall.delete( mvWp1x )
+    wall.delete( mvWp0y )
+    wall.delete( mvWp1y )
+    if global.dim == 3 then
+      wall.delete( mvWp0z )
+      wall.delete( mvWp1z )
+    end_if
+  else if mv_shape == 1
+    wall.delete( mvWp0z )
+    wall.delete( mvWp1z )
+    wall.delete( mvWpCyl )
+  else ; mv_shape == 2
+    wall.delete( mvWpSph )
+  end_if
+end
+;------------------------------------------------
+def mv_wStressZero
+  mv_wsx = 0.0
+  mv_wsy = 0.0
+  mv_wsz = 0.0
+  mv_wsr = 0.0
+  mv_wPx = 0.0
+  mv_wPy = 0.0
+  mv_wPz = 0.0
+  mv_wPr = 0.0
+  mv_wsa = 0.0
+  mv_wsr = 0.0
+  mv_wsd = 0.0
+  mv_wsm = 0.0
+end
+;------------------------------------------------
+def mv_wStrainZero
+  ; Establish reference dimensions: set initial
+  _wdx0 = _wdx
+  _wdy0 = _wdy
+  if global.dim == 3 then
+    _wdz0 = _wdz
+    _wdr0 = _wdr
+  end_if
+  ; Zero the strain quantities
+  mv_wex = 0.0
+  mv_wey = 0.0
+  mv_wez = 0.0
+  mv_wea = 0.0
+  mv_wer = 0.0
+  mv_wed = 0.0
+  mv_wev = 0.0
+end
+;------------------------------------------------
+def mv_wStress
+; Update the material vessel wall-based stress quantities.
+;
+; IN:  mvWp{0,1}{x,y,z}, mvWpCyl, mvWpSph, _wA{x,y,z,r}, mv_shape
+; OUT: mv_wsX, mv_wPX
+;
+  if mv_shape == 0 then
+    if global.dim == 3 then
+      mv_wsx = 0.5*( wall.force.contact(mvWp0x, 1) - wall.force.contact(mvWp1x, 1) ) / _wAx
+      mv_wsy = 0.5*( wall.force.contact(mvWp0y, 2) - wall.force.contact(mvWp1y, 2) ) / _wAy
+      mv_wsz = 0.5*( wall.force.contact(mvWp0z, 3) - wall.force.contact(mvWp1z, 3) ) / _wAz
+      mv_wPz = -mv_wsz
+    else ; 2D model
+      mv_wsx = 0.5*( wall.force.contact(mvWp0x, 1) - wall.force.contact(mvWp1x, 1) ) / _wAx
+      mv_wsy = 0.5*( wall.force.contact(mvWp0y, 2) - wall.force.contact(mvWp1y, 2) ) / _wAy
+    end_if
+    mv_wPx = -mv_wsx
+    mv_wPy = -mv_wsy
+  else if mv_shape == 1
+    mv_wsz = 0.5*( wall.force.contact(mvWp0z, 3) - wall.force.contact(mvWp1z, 3) ) / _wAz
+    mv_wsr = _mvsRadForce / _wAr
+    mv_wPz = -mv_wsz
+    mv_wPr = -mv_wsr
+  else ; mv_shape == 2
+    mv_wsr = _mvsRadForce / _wAr
+    mv_wPr = -mv_wsr
+  end_if
+  ;
+  if global.dim == 3 then  ; set mv_ws{a,r,m}
+    if mv_shape == 0 then
+      mv_wsa = mv_wsz
+      mv_wsr = 0.5 * (mv_wsx + mv_wsy)
+    else if mv_shape == 1 then
+      mv_wsa = mv_wsz
+      ; mv_wsr set above
+    else ; mv_shape == 2
+      ; mv_wsr set above
+      mv_wsa = mv_wsr
+    end_if
+    mv_wsm = _ftOneThird * (mv_wsa + 2.0*mv_wsr)
+  else ; 2D model
+    mv_wsa = mv_wsy
+    mv_wsr = mv_wsx
+    mv_wsm = 0.5 * (mv_wsa + mv_wsr)
+  end_if
+  mv_wsd = mv_wsa - mv_wsr
+end
+;------------------------------------------------
+def _mvsRadForce
+; Return the radial force acting on the cylinder or sphere wall.
+; IN: mv_shape, mvWpCyl, mvWpSph
+  local FrSum = 0.0
+  local Fgbl, nr
+  if mv_shape == 1 then
+    loop foreach cp wall.contactmap( mvWpCyl ) ; visit all active contacts of the cylinder wall
+      Fgbl = vector( comp.x( contact.force.global(cp) ),   ...
+                     comp.y( contact.force.global(cp) )  )
+      nr = math.unit( vector( comp.x( contact.pos(cp) ),   ...
+                              comp.y( contact.pos(cp) )  ) ...
+                    )
+      FrSum = FrSum - math.dot( Fgbl, nr )
+    end_loop
+  else ; mv_shape == 2
+    loop foreach cp wall.contactmap( mvWpSph ) ; visit all active contacts of the sphere wall
+      Fgbl = vector( comp.x( contact.force.global(cp) ),   ...
+                     comp.y( contact.force.global(cp) ),   ...
+                     comp.z( contact.force.global(cp) )  )
+      nr = math.unit( vector( comp.x( contact.pos(cp) ),   ...
+                              comp.y( contact.pos(cp) ),   ...
+                              comp.z( contact.pos(cp) )  ) ...
+                    )
+      FrSum = FrSum - math.dot( Fgbl, nr )
+    end_loop
+  end_if
+  _mvsRadForce = FrSum
+end
+;------------------------------------------------
+def mv_wStrain
+; Update the material vessel wall-based strain quantities.
+; IN:  mvWp{0,1}{x,y,z}, mvWpCyl, mvWpSph
+; OUT: _wd{x,y,z,r}, _wA{x,y,z,r}
+;      mv_weX
+;
+  ; *** Update distances between opposing walls:
+  if mv_shape == 0 then
+    _wdx = wall.pos( mvWp1x, 1 ) - wall.pos( mvWp0x, 1 )
+    _wdy = wall.pos( mvWp1y, 2 ) - wall.pos( mvWp0y, 2 )
+    if global.dim == 3 then
+      _wdz = wall.pos( mvWp1z, 3 ) - wall.pos( mvWp0z, 3 )
+    end_if
+  else if mv_shape == 1
+    _wdz = wall.pos( mvWp1z, 3 ) - wall.pos( mvWp0z, 3 )
+  end_if
+  ; _wdr is set in _mvsUpdateRadDiam (called just before mv_wStrain)
+  _mv_wAreas
+  ;
+  ; *** Strains:
+  if mv_shape == 0 then
+    mv_wex = (_wdx - _wdx0) / _wdx0
+    mv_wey = (_wdy - _wdy0) / _wdy0
+    if global.dim == 3 then
+      mv_wez = (_wdz - _wdz0) / _wdz0
+    end_if
+  else if mv_shape == 1
+    mv_wez = (_wdz - _wdz0) / _wdz0
+    mv_wer = (_wdr - _wdr0) / _wdr0
+  else ; mv_shape == 2
+    mv_wer = (_wdr - _wdr0) / _wdr0
+  end_if
+  if global.dim == 3 then  ; set mv_we{a,r,v}
+    if mv_shape == 0 then
+      mv_wea = mv_wez
+      mv_wer = 0.5 * (mv_wex + mv_wey)
+    else if mv_shape == 1
+      mv_wea = mv_wez
+      ; mv_wer set above
+    else ; mv_shape == 2
+      ; mv_wer set above
+      mv_wea = mv_wer
+    end_if
+    mv_wev = mv_wea + 2.0*mv_wer
+  else ; 2D model
+    mv_wea = mv_wey
+    mv_wer = mv_wex
+    mv_wev = mv_wea + mv_wer
+  end_if
+  mv_wed = mv_wea - mv_wer
+end
+;------------------------------------------------
+def _mv_wAreas
+;
+; IN:  mv_wAreaMode
+; OUT: _wA{x,y,z,r}
+;
+  if mv_shape == 0 then
+    if global.dim == 3 then
+      if mv_wAreaMode == 0 then
+        _wAx = _wdy * _wdz
+        _wAy = _wdx * _wdz
+        _wAz = _wdx * _wdy
+      else
+        _wAx = mv_W * mv_H
+        _wAy = mv_D * mv_H
+        _wAz = mv_D * mv_W
+      end_if
+    else ; 2D model
+      if mv_wAreaMode == 0 then
+        _wAx = _wdy
+        _wAy = _wdx
+      else
+        _wAx = mv_H
+        _wAy = mv_W
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mv_wAreaMode == 0 then
+      _wAz = 0.25 * math.pi * _wdr * _wdr
+      _wAr = math.pi * _wdr * _wdz
+    else
+      _wAz = 0.25 * math.pi * mv_W * mv_W
+      _wAr = math.pi * mv_W * mv_H
+    end_if
+  else ; mv_shape == 2
+    if mv_wAreaMode == 0 then
+      _wAr = math.pi * _wdr * _wdr
+    else
+      _wAr = math.pi * mv_H * mv_H
+    end_if
+  end_if
+end
+;------------------------------------------------
+def mv_wPoros
+; Update the material vessel wall-based porosity.
+; IN:  mvMp{1,2,3}
+; OUT: mv_wn (defined above)
+;
+  local _sumVg = 0.0
+  local _bVol
+  loop foreach local bp ball.list
+    if global.dim == 3 then
+      _bVol = (4.0/3.0)*math.pi*ball.radius(bp)*ball.radius(bp)*ball.radius(bp)
+    else ; 2D model
+      _bVol = math.pi*ball.radius(bp)*ball.radius(bp)
+    end_if
+    _sumVg = _sumVg + _bVol
+  end_loop
+  loop foreach local cp clump.list
+    local _cVol = clump.vol(cp)
+    _sumVg = _sumVg + _cVol
+  end_loop
+  ;
+  if _sumVg == 0.0 then
+    mv_wn = 0.0
+  else
+    mv_wn = 1.0 - ( _sumVg / _mvVolume(false) )
+  end_if
+end
+;************************************************
+def mvs_on
+  Array _mvsGainStored(4)
+  Array _mvsGainCnt(4)
+  ;
+  if mvs_vLimit <= 0 then
+    util.error = 'Servomechanism requires positive value for mvs_vLimit.'
+  end_if
+  if mvs_gainUpdateRate == 0 then ; default
+    mvs_gainUpdateRate = 25
+  else
+    if mvs_gainUpdateRate < 1 then
+      util.error = 'mvs_gainUpdateRate must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  ; Force gain computation
+  loop local i (1, 4)
+    _mvsGainCnt(i) = mvs_gainUpdateRate
+  end_loop
+  ;
+  command
+    set fish callback -1    _mvsActive               ; beginning of the step
+    set fish callback 10.11 _mvsCheckMeasWallOverlap ; just after mv_wStrain
+  end_command
+  if mv_shape # 0 then ; mv_shape = {1,2}
+    command
+      set fish callback 10.09 _mvsUpdateRadDiam  ; after EOMs, just before mv_wStrain
+    end_command
+  end_if
+end
+;------------------------------------------------
+def mvs_off
+; Turn off the servomechanism, and zero the velocities of all servo-controlled walls.
+  command
+    set fish callback -1    remove _mvsActive
+    set fish callback 10.11 remove _mvsCheckMeasWallOverlap
+  end_command
+  if mv_shape # 0 then ; mv_shape = {1,2}
+    command
+      set fish callback 10.09 remove _mvsUpdateRadDiam
+    end_command
+  end_if
+  if mv_shape == 0 then
+    if mvs_BCx == 1 then
+      wall.vel( mvWp0x, 1 ) = 0.0
+      wall.vel( mvWp1x, 1 ) = 0.0
+    end_if
+    if mvs_BCy == 1 then
+      wall.vel( mvWp0y, 2 ) = 0.0
+      wall.vel( mvWp1y, 2 ) = 0.0
+    end_if
+    if global.dim == 3 then
+      if mvs_BCz == 1 then
+        wall.vel( mvWp0z, 3 ) = 0.0
+        wall.vel( mvWp1z, 3 ) = 0.0
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mvs_BCz == 1 then
+      wall.vel( mvWp0z, 3 ) = 0.0
+      wall.vel( mvWp1z, 3 ) = 0.0
+    end_if
+    if mvs_BCr == 1 then
+      _mvsSetRadVel( 0.0 )
+    end_if
+  else ; mv_shape == 2
+    if mvs_BCr == 1 then
+      _mvsSetRadVel( 0.0 )
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _mvsCheckMeasWallOverlap
+; IN: _wd{x,y,z,r}, _mvMp{Ax,Rad}Len
+;
+  local _wdHt
+  if global.dim == 3 then
+    if mv_shape == 2 then
+      _wdHt = _wdr
+    else ; mv_shape = {0,1}
+      _wdHt = _wdz
+    end_if
+  else ; 2D model
+    _wdHt = _wdy
+  end_if
+  if _wdHt <= _mvMpAxLen then
+    util.error = 'Material-vessel axial (upper/lower) walls overlap the measurement regions, decrease mv_inset{L,D}Fac.'
+  end_if
+  ;
+  local overlapSides = false
+  if mv_shape == 0 then
+    if _wdx <= _mvMpRadLenX then
+      overlapSides = true
+    end_if
+    if global.dim == 3 then
+      if _wdy <= _mvMpRadLenY then
+        overlapSides = true
+      end_if
+    end_if
+  else ; mv_shape == {1,2}
+    if _wdr <= _mvMpRadLenX then
+      overlapSides = true
+    end_if
+  end_if
+  ;
+  if overlapSides then
+    util.error = 'Material-vessel side walls overlap the measurement regions, decrease mv_inset{L,D}Fac.'
+  end_if
+end
+;------------------------------------------------
+def mvs_setBCs
+; Set the velocity conditions, pressure conditions are enforced by _mvsActive.
+  if mv_shape == 0 then
+    if mvs_BCx == 0 then
+      wall.vel( mvWp0x, 1 ) = -mvs_BCxVal
+      wall.vel( mvWp1x, 1 ) =  mvs_BCxVal
+    else
+      if mvs_BCxVal <= 0.0 then
+        util.error = 'mvs_setBCs: Pressure (mvs_BCxVal) must be non-zero and positive.'
+      end_if
+    end_if
+    if mvs_BCy == 0 then
+      wall.vel( mvWp0y, 2 ) = -mvs_BCyVal
+      wall.vel( mvWp1y, 2 ) =  mvs_BCyVal
+    else
+      if mvs_BCyVal <= 0.0 then
+        util.error = 'mvs_setBCs: Pressure (mvs_BCyVal) must be non-zero and positive.'
+      end_if
+    end_if
+    if global.dim == 3 then
+      if mvs_BCz == 0 then
+        wall.vel( mvWp0z, 3 ) = -mvs_BCzVal
+        wall.vel( mvWp1z, 3 ) =  mvs_BCzVal
+      else
+        if mvs_BCzVal <= 0.0 then
+          util.error = 'mvs_setBCs: Pressure (mvs_BCzVal) must be non-zero and positive.'
+        end_if
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mvs_BCz == 0 then
+      wall.vel( mvWp0z, 3 ) = -mvs_BCzVal
+      wall.vel( mvWp1z, 3 ) =  mvs_BCzVal
+    else
+      if mvs_BCzVal <= 0.0 then
+        util.error = 'mvs_setBCs: Pressure (mvs_BCzVal) must be non-zero and positive.'
+      end_if
+    end_if
+    if mvs_BCr == 0 then
+      _mvsSetRadVel( mvs_BCrVal )
+    else
+      if mvs_BCrVal <= 0.0 then
+        util.error = 'mvs_setBCs: Pressure (mvs_BCrVal) must be non-zero and positive.'
+      end_if
+    end_if
+  else ; mv_shape == 2
+    if mvs_BCr == 0 then
+      _mvsSetRadVel( mvs_BCrVal )
+    else
+      if mvs_BCrVal <= 0.0 then
+        util.error = 'mvs_setBCs: Pressure (mvs_BCrVal) must be non-zero and positive.'
+      end_if
+    end_if
+  end_if
+  ;
+  _mvsEnforceVlimit
+end
+;------------------------------------------------
+def mvs_applyConfinement( Pc, eqPTol, ARatLimit, stepLimit )
+; Attempt to confine the specimen by activating the servo control in all direcs.
+; Confinement applicaton is successful if both mvs_eqP and ft_eq indicate that static equilibrium
+; has been obtained. If confinement application is unsuccessful, then throw an error.
+;
+; PARAMS:
+;   Pc        : confining pressure, applied equally in all direcs.
+;   eqPTol    : equil-pressure tolerance
+;   ARatLimit : equil-ratio limit
+;   stepLimit : step limit
+;
+  local myStr = '** mvs_applyConfinement (entering with parameters:'
+  myStr = myStr + ' Pc: '+string(Pc)+','
+  myStr = myStr + ' eqPTol: '+string(eqPTol)+','
+  myStr = myStr + ' ARatLimit: '+string(ARatLimit)+','
+  myStr = myStr + ' stepLimit: '+string(stepLimit)+')'
+  io.out( myStr )
+
+  if mv_shape == 0 then
+    mvs_BCx = 1
+    mvs_BCxVal = Pc
+    mvs_BCy = 1
+    mvs_BCyVal = Pc
+    if global.dim == 3 then
+      mvs_BCz = 1
+      mvs_BCzVal = Pc
+    end_if
+  else if mv_shape == 1
+    mvs_BCz = 1
+    mvs_BCzVal = Pc
+    mvs_BCr = 1
+    mvs_BCrVal = Pc
+  else ; mv_shape == 2
+    mvs_BCr = 1
+    mvs_BCrVal = Pc
+  end_if
+  mvs_setBCs
+
+  local retCode
+  retCode = mvs_eqP( eqPTol, stepLimit )
+  if retCode # 0 then
+    util.error = 'Confinement application failed: did not reach equil-pressure tolerance.'
+  end_if
+
+  retCode = ft_eq( ARatLimit, stepLimit )
+  if retCode # 0 then
+    util.error = 'Confinement application failed: did not reach mech-aratio.'
+  end_if
+  io.out('** mvs_applyConfinement, Confinement application successful (exiting).')
+end
+;------------------------------------------------
+def mvs_eqP( eqPTol, stepLimit )
+; Cycle the model until either the pressures of all servo-controlled walls are within
+; the equilibrium-pressure tolerance of the target values or the step limit is reached.
+; PARAMS:
+;   eqPTol    : equilibrium-pressure tolerance
+;   stepLimit : step limit (for {solve max_cycles} command)
+; Returns:
+;   0 : equilibrium-pressure tolerance met
+;   1 : step limit reached before equilibrium-pressure tolerance met
+;
+  local myStr = '** mvs_eqP (entering with parameters:'
+  myStr = myStr + ' eqPTol: '+string(eqPTol)+','
+  myStr = myStr + ' stepLimit: '+string(stepLimit)+')'
+  io.out( myStr )
+  ;
+  _eqPTol = eqPTol ; function _eqPMet cannot have parameters, so must use this global
+  command
+    cycle 1
+  end_command
+  command
+    solve fishhalt _eqPMet max_cycles @stepLimit
+  end_command
+  local returnCode = 0
+  if _eqPMet # 0 then
+    returnCode = 0
+  else
+    returnCode = 1
+  end_if
+  ;
+  myStr = '** mvs_eqP (exiting with condition: '
+  if returnCode == 0 then
+    myStr = myStr + 'eqPTol met)'
+  else
+    myStr = myStr + 'stepLimit reached, but eqPTol not met)'
+  end_if
+  io.out( myStr )
+  if mv_shape == 0 then
+    if mvs_BCx == 1 then
+      io.out('     [_eqPxeps: '+string(_eqPxeps)+']')
+    end_if
+    if mvs_BCy == 1 then
+      io.out('     [_eqPyeps: '+string(_eqPyeps)+']')
+    end_if
+    if global.dim == 3 then
+      if mvs_BCz == 1 then
+        io.out('     [_eqPzeps: '+string(_eqPzeps)+']')
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mvs_BCz == 1 then
+      io.out('     [_eqPzeps: '+string(_eqPzeps)+']')
+    end_if
+    if mvs_BCr == 1 then
+      io.out('     [_eqPreps: '+string(_eqPreps)+']')
+    end_if
+  else ; mv_shape == 2
+    if mvs_BCr == 1 then
+      io.out('     [_eqPreps: '+string(_eqPreps)+']')
+    end_if
+  end_if
+  ;
+  mvs_eqP = returnCode
+end
+;------------------------------------------------
+def _eqPMet  ;{o: _eqP{x,y,z,r}eps; i: _eqPTol}
+;
+  local AllMet = 1
+  if mv_shape == 0 then
+    if mvs_BCx == 1 then
+      if mvs_BCxVal > 0.0 then
+        _eqPxeps = math.abs(mv_wPx - mvs_BCxVal) / mvs_BCxVal
+      else
+        _eqPxeps = 0.0
+      end_if
+      if _eqPxeps > _eqPTol then
+        AllMet = 0
+      end_if
+    end_if
+    if mvs_BCy == 1 then
+      if mvs_BCyVal > 0.0 then
+        _eqPyeps = math.abs(mv_wPy - mvs_BCyVal) / mvs_BCyVal
+      else
+        _eqPyeps = 0.0
+      end_if
+      if _eqPyeps > _eqPTol then
+        AllMet = 0
+      end_if
+    end_if
+    if global.dim == 3 then
+      if mvs_BCz == 1 then
+        if mvs_BCzVal > 0.0 then
+          _eqPzeps = math.abs(mv_wPz - mvs_BCzVal) / mvs_BCzVal
+        else
+          _eqPzeps = 0.0
+        end_if
+        if _eqPzeps > _eqPTol then
+          AllMet = 0
+        end_if
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mvs_BCz == 1 then
+      if mvs_BCzVal > 0.0 then
+        _eqPzeps = math.abs(mv_wPz - mvs_BCzVal) / mvs_BCzVal
+      else
+        _eqPzeps = 0.0
+      end_if
+      if _eqPzeps > _eqPTol then
+        AllMet = 0
+      end_if
+    end_if
+    if mvs_BCr == 1 then
+      if mvs_BCrVal > 0.0 then
+        _eqPreps = math.abs(mv_wPr - mvs_BCrVal) / mvs_BCrVal
+      else
+        _eqPreps = 0.0
+      end_if
+      if _eqPreps > _eqPTol then
+        AllMet = 0
+      end_if
+    end_if
+  else ; mv_shape == 2
+    if mvs_BCr == 1 then
+      if mvs_BCrVal > 0.0 then
+        _eqPreps = math.abs(mv_wPr - mvs_BCrVal) / mvs_BCrVal
+      else
+        _eqPreps = 0.0
+      end_if
+      if _eqPreps > _eqPTol then
+        AllMet = 0
+      end_if
+    end_if
+  end_if
+  _eqPMet = AllMet
+end
+;------------------------------------------------
+def _mvsEnforceVlimit
+  if mv_shape == 0 then
+    if math.abs( wall.vel(mvWp0x,1) ) > mvs_vLimit then
+      wall.vel(mvWp0x,1) = mvs_vLimit * ( wall.vel(mvWp0x,1) / math.abs(wall.vel(mvWp0x,1)) ...
+                                        )
+    end_if
+    if math.abs( wall.vel(mvWp1x,1) ) > mvs_vLimit then
+      wall.vel(mvWp1x,1) = mvs_vLimit * ( wall.vel(mvWp1x,1) / math.abs(wall.vel(mvWp1x,1)) ...
+                                        )
+    end_if
+    ;
+    if math.abs( wall.vel(mvWp0y,2) ) > mvs_vLimit then
+      wall.vel(mvWp0y,2) = mvs_vLimit * ( wall.vel(mvWp0y,2) / math.abs(wall.vel(mvWp0y,2)) ...
+                                        )
+    end_if
+    if math.abs( wall.vel(mvWp1y,2) ) > mvs_vLimit then
+      wall.vel(mvWp1y,2) = mvs_vLimit * ( wall.vel(mvWp1y,2) / math.abs(wall.vel(mvWp1y,2)) ...
+                                        )
+    end_if
+    ;
+    if global.dim == 3 then
+      if math.abs( wall.vel(mvWp0z,3) ) > mvs_vLimit then
+        wall.vel(mvWp0z,3) = mvs_vLimit * ( wall.vel(mvWp0z,3) / math.abs(wall.vel(mvWp0z,3)) ...
+                                          )
+      end_if
+      if math.abs( wall.vel(mvWp1z,3) ) > mvs_vLimit then
+        wall.vel(mvWp1z,3) = mvs_vLimit * ( wall.vel(mvWp1z,3) / math.abs(wall.vel(mvWp1z,3)) ...
+                                          )
+      end_if
+    end_if
+  else if mv_shape == 1
+    if math.abs( wall.vel(mvWp0z,3) ) > mvs_vLimit then
+      wall.vel(mvWp0z,3) = mvs_vLimit * ( wall.vel(mvWp0z,3) / math.abs(wall.vel(mvWp0z,3)) ...
+                                        )
+    end_if
+    if math.abs( wall.vel(mvWp1z,3) ) > mvs_vLimit then
+      wall.vel(mvWp1z,3) = mvs_vLimit * ( wall.vel(mvWp1z,3) / math.abs(wall.vel(mvWp1z,3)) ...
+                                        )
+    end_if
+    ;
+    local rVel
+    if math.abs( _mvsRadVel ) > mvs_vLimit then
+      rVel = mvs_vLimit * ( _mvsRadVel / math.abs(_mvsRadVel) ...
+                          )
+      _mvsSetRadVel( rVel )
+    end_if
+  else ; mv_shape == 2
+    if math.abs( _mvsRadVel ) > mvs_vLimit then
+      rVel = mvs_vLimit * ( _mvsRadVel / math.abs(_mvsRadVel) ...
+                          )
+      _mvsSetRadVel( rVel )
+    end_if
+  end_if
+ end
+;------------------------------------------------
+ def _mvsSetRadVel( rVel )
+; Set the radial velocity of all cylinder- or sphere-wall vertices to rVel.
+; IN: mv_shape, mvWpCyl, mvWpSph
+; PARAM:
+;   rVel : radial velocity
+  _mvsRadVel = rVel
+  local nr
+  if mv_shape == 1 then
+    loop foreach vp wall.vertexlist( mvWpCyl )
+      nr = math.unit( vector( comp.x( wall.vertex.pos(vp) ),   ...
+                              comp.y( wall.vertex.pos(vp) )  ) ...
+                    )
+      wall.vertex.vel(vp) = rVel * nr
+    end_loop
+  else ; mv_shape == 2
+    loop foreach vp wall.vertexlist( mvWpSph )
+      nr = math.unit( vector( comp.x( wall.vertex.pos(vp) ),   ...
+                              comp.y( wall.vertex.pos(vp) ),   ...
+                              comp.z( wall.vertex.pos(vp) )  ) ...
+                    )
+      wall.vertex.vel(vp) = rVel * nr
+    end_loop
+  end_if
+ end
+;------------------------------------------------
+def _mvsUpdateRadDiam
+; Update diameter of the cylinder- or sphere-wall (stored as _wdr).
+;
+  _wdr = _wdr + 2.0 * _mvsRadVel * mech.timestep
+end
+;------------------------------------------------
+def _mvsActive
+; Control velocities of wall pairs with pressure BCs.
+;
+  local wGain, wVel
+  if mv_shape == 0 then
+    if mvs_BCx == 1 then
+      wGain = _mvsGain(1)
+      if wGain == -1.0 then
+        wVel = -mvs_vLimit  ; closing at velocity limit
+      else
+        wVel = wGain * ( mv_wPx - mvs_BCxVal )
+      end_if
+      wall.vel( mvWp0x, 1 ) = -wVel
+      wall.vel( mvWp1x, 1 ) =  wVel
+    end_if
+    if mvs_BCy == 1 then
+      wGain = _mvsGain(2)
+      if wGain == -1.0 then
+        wVel = -mvs_vLimit  ; closing at velocity limit
+      else
+        wVel = wGain * ( mv_wPy - mvs_BCyVal )
+      end_if
+      wall.vel( mvWp0y, 2 ) = -wVel
+      wall.vel( mvWp1y, 2 ) =  wVel
+    end_if
+    if global.dim == 3 then
+      if mvs_BCz == 1 then
+        wGain = _mvsGain(3)
+        if wGain == -1.0 then
+          wVel = -mvs_vLimit  ; closing at velocity limit
+        else
+          wVel = wGain * ( mv_wPz - mvs_BCzVal )
+        end_if
+        wall.vel( mvWp0z, 3 ) = -wVel
+        wall.vel( mvWp1z, 3 ) =  wVel
+      end_if
+    end_if
+  else if mv_shape == 1
+    if mvs_BCz == 1 then
+      wGain = _mvsGain(3)
+      if wGain == -1.0 then
+        wVel = -mvs_vLimit  ; closing at velocity limit
+      else
+        wVel = wGain * ( mv_wPz - mvs_BCzVal )
+      end_if
+      wall.vel( mvWp0z, 3 ) = -wVel
+      wall.vel( mvWp1z, 3 ) =  wVel
+    end_if
+    if mvs_BCr == 1 then
+      wGain = _mvsGain(4)
+      if wGain == -1.0 then
+        wVel = -mvs_vLimit  ; closing at velocity limit
+      else
+        wVel = wGain * ( mv_wPr - mvs_BCrVal )
+      end_if
+      _mvsSetRadVel( wVel )
+    end_if
+  else ; mv_shape == 2
+    if mvs_BCr == 1 then
+      wGain = _mvsGain(4)
+      if wGain == -1.0 then
+        wVel = -mvs_vLimit  ; closing at velocity limit
+      else
+        wVel = wGain * ( mv_wPr - mvs_BCrVal )
+      end_if
+      _mvsSetRadVel( wVel )
+    end_if
+  end_if
+  _mvsEnforceVlimit
+end
+;------------------------------------------------
+def _mvsGain( dir )
+; Return the gain for the wall-pair, or cylinder/sphere-wall in direction [dir].
+; If gain cannot be determined (KnSum = 0), then return -1.0.
+; PARAM:
+;   dir : {1,2,3,4} = {'x','y','z','r'} [int]
+;
+; IN: mvs_gainUpdateRate, _mvsGainStored(4), _mvsGainCnt(4)
+;
+  _mvsGainCnt(dir) = _mvsGainCnt(dir) + 1
+  if _mvsGainCnt(dir) >= mvs_gainUpdateRate then
+    _mvsGainStored(dir) = _mvsGainCompute(dir)
+    _mvsGainCnt(dir) = 0
+  end_if
+  _mvsGain = _mvsGainStored(dir)
+end
+;------------------------------------------------
+def _mvsGainCompute( dir )
+; PARAM:
+;   dir : {1,2,3,4} = {'x','y','z','r'} [int]
+;
+  local Area, KnSum, cp, wp0, wp1
+  case_of dir
+      util.error = 'dir is not {1,2,3,4}.'
+    case 1 ;'x'
+      Area = 2.0 * _wAx  ; total platen area perpendicular to x-direc.
+      wp0 = mvWp0x
+      wp1 = mvWp1x
+    case 2 ;'y'
+      Area = 2.0 * _wAy  ; total platen area perpendicular to y-direc.
+      wp0 = mvWp0y
+      wp1 = mvWp1y
+    case 3 ;'z'
+      Area = 2.0 * _wAz  ; total platen area perpendicular to z-direc.
+      wp0 = mvWp0z
+      wp1 = mvWp1z
+    case 4 ;'r'
+      Area = _wAr ; lateral surface area
+      if mv_shape == 1 then
+        wp0 = mvWpCyl
+      else ; mv_shape == 2
+        wp0 = mvWpSph
+      end_if
+  end_case
+  local Alpha = 0.5
+  loop foreach cp wall.contactmap( wp0 )
+    KnSum = KnSum + contact.prop( cp, 'kn' )
+  end_loop
+  if mv_shape == 0 then
+    loop foreach cp wall.contactmap( wp1 )
+      KnSum = KnSum + contact.prop( cp, 'kn' )
+    end_loop
+  end_if
+  if KnSum > 0.0 then
+    _mvsGainCompute = (Alpha * Area) / (KnSum * mech.timestep)
+  else
+    _mvsGainCompute = -1.0
+  end_if
+end
+;************************************************
+; Support for microstructural plots, public functions: msX
+;   msOn, msOff, msUpdateRate, msForceUpdate, msBoxDefine
+;   GEOMETRY SET ITEMS:
+;     _msPoly4, _msLine, _msDisk, _msCylinder, _msLineThick2D, _msCircle2D
+;   SUPPORT FUNCTIONS:
+;      _msGrainPiecePt, _msLocalS
+;
+; Each microstructural plot is called a plot set, in which the plot information is stored as a
+; geometry set, and displayed by the geometry plot item by specifying: {ColorBy: Set}, and
+; {Sets: <geometry set name>}. The plot sets are regenerated at a specified rate (msUpdateRate)
+; during cycling, and the regeneration can be forced to occur via @msForceUpdate.
+; An axis-aligned microstructural box (defined by @msBoxDefine) is associated with the plot sets.
+; The box is displayed by the geometry plot item by specifying: {ColorBy: Set}, and
+; {Sets: msBox}. The grains with centers inside the box can be displayed with either: (a) the ball
+; and clump plot items by specifying: {Color By: Text Val: msBoxIN}, or (b) the "grain" and
+; "faced grain" plot sets. The contact-based plot sets display only the entities joining the
+; grains in the box. The following plot sets are available (each has inputs to control sizing):
+;   Grain-based:
+;     _msGN_Make  (grains)
+;     _msFGN_Make (faced grains)
+;   Contact-based:
+;     _msCB_Make  (contact bonds)
+;     _msPBi_Make (parallel bonds as interfaces)
+;     _msPBc_Make (parallel bonds as cement)
+;     _msFJi_Make (flat-joint interfaces)
+;************************************************
+def msOn
+  if _msOn then
+    exit
+  end_if
+  ;
+  if msUpdateRate == 0 then ; default
+    msUpdateRate = 500
+  else
+    if msUpdateRate < 1 then
+      util.error = 'msUpdateRate must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  if _msBoxDefined = false then ; default, infinite-size box
+    if global.dim == 3 then
+      msBoxDefine( [vector(0.0, 0.0, 0.0)], [vector(1e20, 1e20, 1e20)] )
+    else ; 2D model
+      msBoxDefine( [vector(0.0, 0.0)]     , [vector(1e20, 1e20)]       )
+    end_if
+  end_if
+  ;
+  command
+    set fish callback 10.10 _msUpdate  ; after EOMs
+  end_command
+  ;
+  _msOn = true
+  msForceUpdate
+end
+;------------------------------------------------
+def msOff
+  if _msOn == false then
+    exit
+  end_if
+  ;
+  command
+    set fish callback 10.10 remove _msUpdate
+  end_command
+  _msOn = false
+end
+;------------------------------------------------
+def msForceUpdate
+  if _msOn then
+    _msUpdateCnt = msUpdateRate ; force the update on next line
+    _msUpdate
+  end_if
+end
+;------------------------------------------------
+def msBoxDefine( ctr, dims )
+; Define the location and dimensions of the axis-aligned microstructural box, and update
+; the associated geometry set.
+;
+; OUTPUT: msBoxCenter - box center (vector)
+;         msBoxDims   - box lengths in x, y and z directions (vector)
+;
+  msBoxCenter = ctr
+  msBoxDims = dims
+  _msBoxGeomSetUpdate
+  _msBoxDefined = true
+end
+;------------------------------------------------
+def _msUpdate
+  _msUpdateCnt = _msUpdateCnt + 1
+  if _msUpdateCnt >= msUpdateRate then
+    _msClear
+    _msBoxMarkGrains
+    ;
+    _msGN_Make
+    _msCB_Make
+    _msPBi_Make
+    _msPBc_Make
+    _msFJi_Make
+    ;
+    _msUpdateCnt = 0
+  end_if
+end
+;------------------------------------------------
+def _msClear
+  if _msCleared then
+    geom.set.delete( geom.set.find( 'grains' ) )
+    geom.set.delete( geom.set.find( 'contact bonds' ) )
+    geom.set.delete( geom.set.find( 'pbond interfaces' ) )
+    geom.set.delete( geom.set.find( 'pbond cement' ) )
+    geom.set.delete( geom.set.find( 'FJ interfaces' ) )
+  end_if
+  local gs = geom.set.create( 'grains' )
+        gs = geom.set.create( 'contact bonds' )
+        gs = geom.set.create( 'pbond interfaces' )
+        gs = geom.set.create( 'pbond cement' )
+        gs = geom.set.create( 'FJ interfaces' )
+  _msCleared = true
+end
+;------------------------------------------------
+def _msBoxGeomSetUpdate
+; Update the geometry set of the microstructural box.
+;
+; INPUT:  msBoxCenter, msBoxDims (see msBoxSet)
+; EFFECT: geometry set 'msBox' updated
+;
+;   8*---^-----*7
+;  4/    | y 3/|
+;  *---------* *6 --->x
+;  |         |/
+;  *---------*
+;  1         2
+;
+  if _msBoxGeomSetUpdated then
+    geom.set.delete( geom.set.find( 'msBox' ) )
+  end_if
+  local gs = geom.set.create( 'msBox' )
+  _msBoxGeomSetUpdated = true
+  ;
+  local P1, P2, P3, P4
+  if global.dim == 3 then
+    P1 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) + 0.5 * comp.z(msBoxDims) )
+    P2 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) + 0.5 * comp.z(msBoxDims) )
+    P3 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) + 0.5 * comp.z(msBoxDims) )
+    P4 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) + 0.5 * comp.z(msBoxDims) )
+    P5 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) - 0.5 * comp.z(msBoxDims) )
+    P6 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) - 0.5 * comp.z(msBoxDims) )
+    P7 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) - 0.5 * comp.z(msBoxDims) )
+    P8 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims), ...
+                 comp.z(msBoxCenter) - 0.5 * comp.z(msBoxDims) )
+    _msPoly4( gs, P1, P2, P3, P4 )
+    _msPoly4( gs, P2, P6, P7, P3 )
+    _msPoly4( gs, P6, P5, P8, P7 )
+    _msPoly4( gs, P5, P1, P4, P8 )
+    _msPoly4( gs, P4, P3, P7, P8 )
+    _msPoly4( gs, P1, P5, P6, P2 )
+  else ; 2D model
+    P1 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims) )
+    P2 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) - 0.5 * comp.y(msBoxDims) )
+    P3 = vector( comp.x(msBoxCenter) + 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims) )
+    P4 = vector( comp.x(msBoxCenter) - 0.5 * comp.x(msBoxDims), ...
+                 comp.y(msBoxCenter) + 0.5 * comp.y(msBoxDims) )
+    _msPoly4( gs, P1, P2, P3, P4 )
+  end_if
+end
+;------------------------------------------------
+def _msBoxMarkGrains
+; Mark the grains with centers inside the microstructural box.
+;
+; INPUT:  msBoxCenter, msBoxDims (see msBoxSet)
+; EFFECT: 'msBox' property of all grains is set to either 'msBoxIN' or 'msBoxOUT'.
+;
+  loop foreach local bp ball.list
+    ball.prop( bp, 'msBox' ) = 'msBoxOUT'
+    ;
+    local xlo = comp.x(msBoxCenter) - comp.x(0.5*msBoxDims)
+    local xhi = comp.x(msBoxCenter) + comp.x(0.5*msBoxDims)
+    local ylo = comp.y(msBoxCenter) - comp.y(0.5*msBoxDims)
+    local yhi = comp.y(msBoxCenter) + comp.y(0.5*msBoxDims)
+    if global.dim == 3 then
+      local zlo = comp.z(msBoxCenter) - comp.z(0.5*msBoxDims)
+      local zhi = comp.z(msBoxCenter) + comp.z(0.5*msBoxDims)
+    end_if
+    ;
+    if global.dim == 3 then
+      if   (comp.x(ball.pos(bp)) >= xlo) & (comp.x(ball.pos(bp)) <= xhi) ...
+         & (comp.y(ball.pos(bp)) >= ylo) & (comp.y(ball.pos(bp)) <= yhi) ...
+         & (comp.z(ball.pos(bp)) >= zlo) & (comp.z(ball.pos(bp)) <= zhi) then
+        ball.prop( bp, 'msBox' ) = 'msBoxIN'
+      end_if
+    else ; 2D model
+      if   (comp.x(ball.pos(bp)) >= xlo) & (comp.x(ball.pos(bp)) <= xhi) ...
+         & (comp.y(ball.pos(bp)) >= ylo) & (comp.y(ball.pos(bp)) <= yhi) then
+        ball.prop( bp, 'msBox' ) = 'msBoxIN'
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msGN_Make
+; The grain plot set displays each grain as a sphere --- only ball-shaped grains are displayed,
+; clump-shaped grains are not supported. The sphere is centered at the ball location, and has
+; radius equal to the scale factor {msGN_sfacRad} times the ball radius. For the 2D model, the
+; grains are displayed as circles.
+;
+; INPUT: msGN_sfacRad - scale factor applied to sphere radius (in range (0.0, 1.0])
+;
+  if msGN_sfacRad == 0 then ;default
+    msGN_sfacRad = 1.0
+  else
+    if (msGN_sfacRad <= 0.0) | (msGN_sfacRad > 1.0) then
+      util.error = '_msGN_Make: msGN_sfacRad must be in range (0.0, 1.0].'
+    end_if
+  end_if
+ ;
+  local gs = geom.set.find('grains')
+  loop foreach bp ball.list
+    if ball.prop( bp, 'msBox' ) == 'msBoxIN' then
+      if global.dim == 3 then
+        _msSphere( gs, ...
+                   ball.pos(bp), [msGN_sfacRad * ball.radius(bp)] )
+      else ; 2D model
+        _msCircle2D( gs, ...
+                     ball.pos(bp), [msGN_sfacRad * ball.radius(bp)] )
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msCB_Make
+; The contact bond plot set displays each intact grain-grain contact bond as a line.
+; The line is centered at the contact location, and has length equal to the scale factor
+; {msCB_sfacLen} times the distance between the centers of the two contacting pieces.
+;
+; INPUT: msCB_sfacLen - scale factor applied to line length (in range (0.0, 1.0])
+;
+  if msCB_sfacLen == 0 then ;default
+    msCB_sfacLen = 0.5
+  else
+    if (msCB_sfacLen <= 0.0) | (msCB_sfacLen > 1.0) then
+      util.error = '_msCB_Make: msCB_sfacLen must be in range (0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  local gs = geom.set.find('contact bonds')
+  loop foreach cp contact.list.all
+    if contact.model(cp) == 'linearcbond' then
+      if contact.prop(cp, 'cb_state') == 3 then
+        if ft_cGrainGrain(cp) then
+          local bp1 = contact.end1(cp)
+          local bp2 = contact.end2(cp)
+          if   (ball.prop( bp1, 'msBox' ) == 'msBoxIN') ...
+             & (ball.prop( bp2, 'msBox' ) == 'msBoxIN') then
+            local p1 = _msGrainPiecePt( cp, 1 )
+            local p2 = _msGrainPiecePt( cp, 2 )
+            _msLine( gs, ...
+                     [msCB_sfacLen * math.mag(p2 - p1)], contact.pos(cp), contact.normal(cp) )
+          end_if
+        end_if
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msPBi_Make
+; The parallel-bond interfaces plot set displays each intact grain-grain parallel bond as
+; a disk with radius equal to the scale factor {msPBi_sfacRad} times the parallel-bond radius (Rbar).
+; The disk is centered at the contact location and lies on the contact plane. For the 2D model,
+; the parallel-bond interfaces are displayed as lines (of length 2*msPBi_sfaceRad*Rbar, and
+; unit-thickness depth).
+;
+; INPUT: msPBi_sfacRad - scale factor applied to disk radius (in range (0.0, 1.0])
+;
+  if msPBi_sfacRad == 0 then ;default
+    msPBi_sfacRad = 0.5  ; draw at half size, because most pbonded materials are microstructurally invalid
+  else
+    if (msPBi_sfacRad <= 0.0) | (msPBi_sfacRad > 1.0) then
+      util.error = '_msPBi_Make: msPBi_sfacRad must be in range (0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  local gs = geom.set.find('pbond interfaces')
+  loop foreach cp contact.list.all
+    if contact.model(cp) == 'linearpbond' then
+      if contact.prop(cp, 'pb_state') == 3 then
+        if ft_cGrainGrain(cp) then
+          local bp1 = contact.end1(cp)
+          local bp2 = contact.end2(cp)
+          if   (ball.prop( bp1, 'msBox' ) == 'msBoxIN') ...
+             & (ball.prop( bp2, 'msBox' ) == 'msBoxIN') then
+            if global.dim == 3 then
+              _msDisk( gs, [msPBi_sfacRad * contact.prop(cp, 'pb_radius')], ...
+                       contact.pos(cp), contact.normal(cp)                      )
+            else ; 2D model
+              local tHat = vector( -contact.normal.y(cp), contact.normal.x(cp) )
+              _msLine( gs, [2.0 * msPBi_sfacRad * contact.prop(cp, 'pb_radius')], ...
+                       contact.pos(cp), tHat)
+            end_if
+          end_if
+        end_if
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msPBc_Make
+; The parallel-bond cement plot set displays each intact grain-grain parallel bond as a
+; cylinder with radius equal to the scale factor {msPBc_sfacRad} times the parallel-bond radius.
+; The cylinder is centered at the contact location, and has a length equal to the scale factor
+; {msPBc_sfacLen} times the distance between the centers of the two contacting pieces (Lp).
+; For the 2D model, the parallel-bond cement is displayed as a rectangle
+; (of width 2*msPBc_sfacRad*Rbar, length Lp, and unit-thickness depth).
+;
+; INPUT: msPBc_sfacRad - scale factor applied to cylinder radius (in range (0.0, 1.0])
+;        msPBc_sfacLen - scale factor applied to cylinder length (in range (0.0, 1.0])
+;
+  if msPBc_sfacRad == 0 then ;default
+    msPBc_sfacRad = 0.5
+  else
+    if (msPBc_sfacRad <= 0.0) | (msPBc_sfacRad > 1.0) then
+      util.error = '_msPBc_Make: msPBc_sfacRad must be in range (0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  if msPBc_sfacLen == 0 then ;default
+    msPBc_sfacLen = 0.5
+  else
+    if (msPBc_sfacLen <= 0.0) | (msPBc_sfacLen > 1.0) then
+      util.error = '_msPBc_Make: msPBc_sfacLen must be in range (0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  local gs = geom.set.find('pbond cement')
+  loop foreach cp contact.list.all
+    if contact.model(cp) == 'linearpbond' then
+      if contact.prop(cp, 'pb_state') == 3 then
+        if ft_cGrainGrain(cp) then
+          local bp1 = contact.end1(cp)
+          local bp2 = contact.end2(cp)
+          if   (ball.prop( bp1, 'msBox' ) == 'msBoxIN') ...
+             & (ball.prop( bp2, 'msBox' ) == 'msBoxIN') then
+            local Lp = msPBc_sfacLen * math.mag( _msGrainPiecePt(cp,2) - _msGrainPiecePt(cp,1) )
+            if global.dim == 3 then
+              _msCylinder( gs,                                                  ...
+                           [msPBc_sfacRad * contact.prop(cp, 'pb_radius')], Lp, ...
+                           contact.pos(cp), contact.normal(cp)                      )
+            else ; 2D model
+              _msLineThick2D( gs,                                                   ...
+                              Lp, contact.pos(cp), contact.normal(cp),              ...
+                              [2.0 * msPBc_sfacRad * contact.prop(cp, 'pb_radius')]     )
+            end_if
+          end_if
+        end_if
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msFJi_Make
+; The flat-joint interfaces plot set displays the interface of each grain-grain flat-jointed
+; contact as a disk with radius equal to the scale factor {msFJi_sfacRad} times the flat-joint
+; radius (R). The disk is centered at the contact location and lies on the contact plane.
+; For the 2D model, the flat-joint interfaces are displayed as lines (of length 2*msFJi_sfaceRad*R,
+; and unit-thickness depth).
+;
+; INPUT: msFJi_sfacRad - scale factor applied to disk radius (in range (0.0, 1.0])
+;
+  if msFJi_sfacRad == 0 then ;default
+    msFJi_sfacRad = 1.0  ; draw at true size!
+  else
+    if (msFJi_sfacRad <= 0.0) | (msFJi_sfacRad > 1.0) then
+      util.error = '_msFJi_Make: msFJi_sfacRad must be in range (0.0, 1.0].'
+    end_if
+  end_if
+  ;
+  local gs = geom.set.find('FJ interfaces')
+  loop foreach cp contact.list.all
+    if contact.model(cp) == 'flatjoint' then
+      if ft_cGrainGrain(cp) then
+        local bp1 = contact.end1(cp)
+        local bp2 = contact.end2(cp)
+        if   (ball.prop( bp1, 'msBox' ) == 'msBoxIN') ...
+           & (ball.prop( bp2, 'msBox' ) == 'msBoxIN') then
+          if global.dim == 3 then
+            _msDisk( gs, [msFJi_sfacRad * contact.prop(cp, 'fj_radius')], ...
+                     contact.pos(cp), contact.normal(cp)                      )
+          else ; 2D model
+            local tHat = vector( -contact.normal.y(cp), contact.normal.x(cp) )
+            _msLine( gs, [2.0 * msFJi_sfacRad * contact.prop(cp, 'fj_radius')], ...
+                     contact.pos(cp), tHat)
+          end_if
+        end_if
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _msPoly3( gs, P1, P2, P3 )
+; PARAMS:
+;   gs - geometry set pointer
+;   Pi - cyclically ordered points, i = {1,2,3} [VEC]
+; The 3-sided polygon is defined by its four cyclically ordered points {Pi}.
+; The 3-sided polygon is stored as a polygon in the geometry set {gs}.
+;
+  local poly = geom.poly.create( gs )
+  geom.poly.add.node( gs, poly, P1 )
+  geom.poly.add.node( gs, poly, P2 )
+  geom.poly.add.node( gs, poly, P3 )
+  geom.poly.close( gs, poly )
+end
+;------------------------------------------------
+def _msPoly4( gs, P1, P2, P3, P4 )
+; PARAMS:
+;   gs - geometry set pointer
+;   Pi - cyclically ordered points, i = {1,2,3,4} [VEC]
+; The 4-sided polygon is defined by its four cyclically ordered points {Pi}.
+; The 4-sided polygon is stored as a polygon in the geometry set {gs}.
+;
+  local poly = geom.poly.create( gs )
+  geom.poly.add.node( gs, poly, P1 )
+  geom.poly.add.node( gs, poly, P2 )
+  geom.poly.add.node( gs, poly, P3 )
+  geom.poly.add.node( gs, poly, P4 )
+  geom.poly.close( gs, poly )
+end
+;------------------------------------------------
+def _msLine( gs, ll, xl, nl )
+; PARAMS:
+;   gs - geometry set pointer
+;   ll - line length
+;   xl - line center
+;   nl - line axis unit-normal
+; The line is defined by its length {ll}, center {xl} and axis unit-normal {nl}.
+; The line is stored as an edge in the geometry set {gs}.
+;
+  geom.edge.create( gs, ...
+                    geom.node.create( gs, [xl - (0.5 * ll * nl)] ), ...
+                    geom.node.create( gs, [xl + (0.5 * ll * nl)] )      )
+end
+;------------------------------------------------
+def _msDisk( gs, rd, xd, nd ) ; PFC3D only
+; PARAMS:
+;   gs - geometry set pointer
+;   rd - disk radius
+;   xd - disk center
+;   nd - disk unit-normal
+; The zero-thickness disk is defined by its radius {rd}, center {xd} and unit-normal {nd}.
+; The disk is stored as a polygon in the geometry set {gs}.
+;
+  if global.dim == 2 then
+    util.error = '_msDisk: PFC3D only.'
+  end_if
+  ;
+  local nSeg = 20 ; number of segments defining disk perimeter (nSeg >= 3)
+  local sHat = _msLocalS( nd )
+  local tHat = math.cross( nd, sHat )
+  ;
+  local poly = geom.poly.create( gs )
+  local delTheta = 2.0 * math.pi / nSeg
+  loop for( local i=1, i<=nSeg, i=i+1 )
+    local theta = (i - 1) * delTheta
+    local P = xd + (rd * math.cos(theta)) * sHat ...
+                 + (rd * math.sin(theta)) * tHat
+    geom.poly.add.node( gs, poly, P )
+  end_loop
+  geom.poly.close( gs, poly )
+end
+;------------------------------------------------
+def _msCylinder( gs, rc, lc, xc, nc ) ; PFC3D only
+; PARAMS:
+;   gs - geometry set pointer
+;   rc - cylinder radius (rc > 0)
+;   lc - cylinder length (lc > 0)
+;   xc - cylinder center
+;   nc - cylinder axis unit-normal
+; The open-ended cylinder is defined by its radius {rc}, length {lc}, center {xc} and unit-normal {n}.
+; The open-ended cylinder is stored as a collection of polygons in the geometry set {gs}.
+;
+  if global.dim == 2 then
+    util.error = '_msCylinder: PFC3D only.'
+  end_if
+  ;
+  local nSeg = 20 ; number of segments defining cylinder perimeter (nSeg >= 3)
+  local sHat = _msLocalS( nc )
+  local tHat = math.cross( nc, sHat )
+  ;
+  local delTheta = 2.0 * math.pi / nSeg
+  loop for( local i=1, i<=nSeg, i=i+1 )
+    local theta0 = (i - 1) * delTheta
+    local theta1 =       i * delTheta
+    local P1 = (xc - 0.5*lc*nc) + (rc * math.cos(theta0)) * sHat ...
+                                + (rc * math.sin(theta0)) * tHat     ; first  bottom disk point
+    local P2 = (xc - 0.5*lc*nc) + (rc * math.cos(theta1)) * sHat ...
+                                + (rc * math.sin(theta1)) * tHat     ; second bottom disk point
+    local P3 = (xc + 0.5*lc*nc) + (rc * math.cos(theta1)) * sHat ...
+                                + (rc * math.sin(theta1)) * tHat     ; second top    disk point
+    local P4 = (xc + 0.5*lc*nc) + (rc * math.cos(theta0)) * sHat ...
+                                + (rc * math.sin(theta0)) * tHat     ; first  top    disk point
+    local poly = geom.poly.create( gs )
+    geom.poly.add.node( gs, poly, P1 )
+    geom.poly.add.node( gs, poly, P2 )
+    geom.poly.add.node( gs, poly, P3 )
+    geom.poly.add.node( gs, poly, P4 )
+    geom.poly.close(    gs, poly     )
+  end_loop
+end
+;------------------------------------------------
+def _msSphere( gs, xs, rs ) ; PFC3D only
+; PARAMS:
+;   gs - geometry set pointer
+;   xs - sphere center
+;   rs - sphere radius
+; The sphere is defined by its center {xs} and radius {rs}.
+; The sphere is stored as a collection of polygons in the geometry set {gs}.
+;
+; Spherical coordinates (r, theta, phi):
+;   x = r*sin(theta)*cos(phi), y = r*sin(theta)*sin(phi), z = r*cos(theta)
+;   with r >= 0, 0 <= theta <= pi, 0 <= phi < 2*pi.
+;   North Pole at (r, 0, phi), South Pole at (r, pi, phi)
+;
+  if global.dim == 2 then
+    util.error = '_msSphere: PFC3D only.'
+  end_if
+  ;
+  local nFac = 60 ; number of facets around sphere equator (nFac is even, >= 8)
+  ;
+  local del_theta = 2.0 * math.pi / nFac
+  local del_phi   = del_theta
+  local tLast = 0.5*nFac
+  loop for( local t=1, t<=tLast, t=t+1 )
+    loop for( local p=1, p<=nFac, p=p+1 )
+      local theta0 = (t-1) * del_theta
+      local theta1 =     t * del_theta
+      local phi0 = (p-1) * del_phi
+      local phi1 =     p * del_phi
+      local P1 = vector( comp.x(xs) + rs * math.sin(theta0) * math.cos(phi0), ...
+                         comp.y(xs) + rs * math.sin(theta0) * math.sin(phi0), ...
+                         comp.z(xs) + rs * math.cos(theta0)                       )
+      local P2 = vector( comp.x(xs) + rs * math.sin(theta0) * math.cos(phi1), ...
+                         comp.y(xs) + rs * math.sin(theta0) * math.sin(phi1), ...
+                         comp.z(xs) + rs * math.cos(theta0)                       )
+      local P3 = vector( comp.x(xs) + rs * math.sin(theta1) * math.cos(phi1), ...
+                         comp.y(xs) + rs * math.sin(theta1) * math.sin(phi1), ...
+                         comp.z(xs) + rs * math.cos(theta1)                       )
+      local P4 = vector( comp.x(xs) + rs * math.sin(theta1) * math.cos(phi0), ...
+                         comp.y(xs) + rs * math.sin(theta1) * math.sin(phi0), ...
+                         comp.z(xs) + rs * math.cos(theta1)                       )
+                         
+      if      (t == 1    ) then ; theta0 is North Pole, P1 = P2 
+        _msPoly3( gs, P2, P3, P4 )
+      else if (t == tLast) then ; theta1 is South Pole, P3 = P4
+        _msPoly3( gs, P1, P2, P3 )
+      else
+        _msPoly4( gs, P1, P2, P3, P4 )
+      end_if
+    end_loop
+  end_loop
+end
+;------------------------------------------------
+def _msLineThick2D( gs, ll, xl, nl, tl ) ; PFC2D only
+; PARAMS:
+;   gs - geometry set pointer
+;   ll - line length
+;   xl - line center
+;   nl - line axis unit-normal (in direction of line length)
+;   tl - line thickness
+; The line is defined by its length {ll}, center {xl}, axis unit-normal {nl} and thickness {tl}.
+; The line is stored as a polygon in the geometry set {gs}.
+;
+;               ^ tHat
+;  4            |            3
+;  *-------------------------*
+;  |                         |
+;  |            *xl          |---> nl
+;  |                         |
+;  *-------------------------*
+;  1                         2
+;
+  if global.dim == 3 then
+    util.error = '_msLineThick2D: PFC2D only.'
+  end_if
+  ;
+  local poly = geom.poly.create( gs )
+  local tHat = vector( -comp.y(nl), comp.x(nl) )  ; nl cross tHat = +kHat
+  local P1 = xl - (0.5 * ll * nl) - (0.5 * tl * tHat)
+  local P2 = xl + (0.5 * ll * nl) - (0.5 * tl * tHat)
+  local P3 = xl + (0.5 * ll * nl) + (0.5 * tl * tHat)
+  local P4 = xl - (0.5 * ll * nl) + (0.5 * tl * tHat)
+  geom.poly.add.node( gs, poly, P1 )
+  geom.poly.add.node( gs, poly, P2 )
+  geom.poly.add.node( gs, poly, P3 )
+  geom.poly.add.node( gs, poly, P4 )
+  geom.poly.close(    gs, poly     )
+end
+;------------------------------------------------
+def _msCircle2D( gs, xc, rc ) ; PFC2D only
+; PARAMS:
+;   gs - geometry set pointer
+;   xc - circle center
+;   rc - circle radius
+; The circle is defined by its center {xc} and radius {rc}.
+; The circle is stored as a polygon in the geometry set {gs}.
+;
+  if global.dim == 3 then
+    util.error = '_msCircle2D: PFC2D only.'
+  end_if
+  ;
+  local nSeg = 30 ; number of segments around circle perimeter (nSeg >= 3)
+                  ; 30 gives approx. same resolution as ball plot item
+  ;
+  local poly = geom.poly.create( gs )
+  local delTheta = 2.0 * math.pi / nSeg
+  loop for( local i=1, i<=nSeg, i=i+1 )
+    local theta = (i - 1) * delTheta
+    local P = vector( comp.x(xc) + rc * math.cos(theta), ...
+                      comp.y(xc) + rc * math.sin(theta)      )
+    geom.poly.add.node( gs, poly, P )
+  end_loop
+  geom.poly.close( gs, poly )
+end
+;------------------------------------------------
+def _msGrainPiecePt( cp, eNum )
+; Return center {pOut} of the piece at end {eNum = 1 or 2} of the two contacting grain pieces
+; joined by contact {cp}. A grain piece is a ball or pebble.
+;
+  local pOut
+  if eNum == 1 then
+    local end1 = contact.end1(cp)
+    if type.pointer.id( end1 ) == ball.typeid then ; end1 is a ball
+      pOut = ball.pos( end1 )
+    else                                           ; end1 is a pebble
+      pOut = clump.pebble.pos( end1 )
+    end_if
+  else if eNum == 2 then
+    local end2 = contact.end2(cp)
+    if type.pointer.id( end2 ) == ball.typeid then ; end2 is a ball
+      pOut = ball.pos( end2 )
+    else                                           ; end2 is a pebble
+      pOut = clump.pebble.pos( end2 )
+    end_if
+  else
+    util.error = '_msGrainPiecePt: eNum is not 1 or 2.'
+  end_if
+  _msGrainPiecePt = pOut
+end
+;------------------------------------------------
+def _msLocalS( np )
+; Return unit vector {sHat} that is aligned with projection of global x or y direction
+; onto the plane with unit normal {np} (whichever is not parallel with {np}).
+;
+  local sHat
+  local iHat = vector( 1.0, 0.0, 0.0 )
+  local jHat = vector( 0.0, 1.0, 0.0 )
+  if math.mag( math.cross( iHat, np ) ) >= _ftCheckZeroTol then
+    sHat = iHat - math.dot( iHat, np ) * np
+  else
+    sHat = jHat - math.dot( jHat, np ) * np
+  end_if
+  sHat = math.unit( sHat )
+  _msLocalS = sHat
+end
+;************************************************
+; Support at FishTank level, public functions: ft_X, private functions: _ftX.
+; Function groupings:
+;   Related to material: ft_mX
+;   Operate on    balls: ft_bX(bp)
+;   Operate on contacts: ft_cX(bp)
+def _ftConstants
+  _ftOneThird = 1.0/3.0
+  _ftOneSixth = 1.0/6.0
+  _ftCheckZeroTol = 1e-6
+end
+@_ftConstants
+;------------------------------------------------
+def _ftModulus( i, n )
+; Return modulus of i with n (C++ notation is i % n), i and n are INTs.
+; The expression _ftModulus(i,n) produces the remainder when i is divided by n,
+; and thus is zero when n divides i exactly.
+;
+  i = int(i)
+  n = int(n)
+  if i == n * (i/n) then
+    _ftModulus = 1
+  else
+    _ftModulus = 0
+  end_if
+end
+;------------------------------------------------
+def ft_SaveState( runName, tagName )
+; Create save state with file name [ <runName>-<tagName>.p{2,3}sav ].
+; The file is saved to the project directory.
+;   For example, given PFC3D, runName of 'myRun' and tagName of 'myTag',
+;   the file name will be: 'myRun-myTag.p3sav'.
+;
+  local fName = string(runName) + '-' + string(tagName)
+  command
+    save [fName] localdir
+  end_command
+end
+;------------------------------------------------
+def ft_SetTitle( titStr )
+  command
+    title [titStr]
+  end_command
+end
+;------------------------------------------------
+def ft_valNormDist( mean, sdev )
+; Return a non-negative value from a normal distribution with
+; given mean and standard deviation.
+;
+  loop while 1 # 0
+    local _val = mean + (math.random.gauss * sdev)
+    if _val >= 0.0 then
+      ft_valNormDist = _val
+      exit
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def ft_eq( ARatLimit, stepLimit )
+; Cycle the model until a state of static equilibrium is obtained. Cycling continues until
+; either the mechanical aratio falls below the equilibrium-ratio limit or
+; the number of steps exceeds the equilibrium-step limit.
+; PARAMS:
+;   ARatLimit : equilibrium-ratio limit (for {solve arat}       command)
+;   stepLimit : equilibrium-step limit  (for {solve max_cycles} command)
+; Returns:
+;   0 : equilibrium-ratio limit met
+;   1 : equilibrium-step limit reached before equilibrium-ratio limit met
+;
+  local myStr = '** ft_eq (entering with parameters:'
+  myStr = myStr + ' ARatLimit: '+string(ARatLimit)+','
+  myStr = myStr + ' stepLimit: '+string(stepLimit)+')'
+  io.out( myStr )
+  ;
+  command
+    cycle 1  ; set up those limits before invoking solve
+    solve aratio @ARatLimit max_cycles @stepLimit
+  end_command
+  local returnCode
+  if mech.solve( 'aratio' ) <= ARatLimit then
+    returnCode = 0
+  else
+    returnCode = 1
+  end_if
+  ;
+  myStr = '** ft_eq (exiting with condition: '
+  if returnCode == 0 then
+    myStr = myStr + 'ARatLimit met)'
+  else
+    myStr = myStr + 'stepLimit reached, but ARatLimit not met)'
+  end_if
+  myStr = myStr + ' [Mech Aratio: '+string( mech.solve('aratio') )+']'
+  io.out( myStr )
+  ;
+  ft_eq = returnCode
+end
+;------------------------------------------------
+def ft_OverlapRatios
+; Compute overlap ratios of all active contacts, and then return maximum, minimum and average values.
+; The OR is the overlap divided by the piece diameter. For grain-grain contacts, there are
+; two ORs, while for grain-wall contacts, there is one OR.
+;
+; OUT: mp_OR{max,min,avg}
+;
+  mp_ORmax = -1.0e20
+  mp_ORmin =  1.0e20
+  mp_ORavg = 0.0
+  local curOR, pieceRad
+  local cntOR = 0
+  local sumOR = 0.0
+  loop foreach local cp contact.list
+    local overlap = -contact.gap(cp)
+    if type.pointer.id(cp) == contact.typeid('ball-ball') then
+      pieceRad = ball.radius( contact.end1(cp) )
+      curOR = overlap / (2.0*pieceRad)
+      mp_ORmax = math.max( curOR, mp_ORmax )
+      mp_ORmin = math.min( curOR, mp_ORmin )
+      cntOR = cntOR + 1
+      sumOR = sumOR + curOR
+      ;
+      pieceRad = ball.radius( contact.end2(cp) )
+      curOR = overlap / (2.0*pieceRad)
+      mp_ORmax = math.max( curOR, mp_ORmax )
+      mp_ORmin = math.min( curOR, mp_ORmin )
+      cntOR = cntOR + 1
+      sumOR = sumOR + curOR
+    else if type.pointer.id(cp) == contact.typeid('ball-facet') then
+      ; For a ball-facet contact, end1 is always a ball.
+      pieceRad = ball.radius( contact.end1(cp) )
+      curOR = overlap / (2.0*pieceRad)
+      mp_ORmax = math.max( curOR, mp_ORmax )
+      mp_ORmin = math.min( curOR, mp_ORmin )
+      cntOR = cntOR + 1
+      sumOR = sumOR + curOR
+    else
+      util.error = 'ft_OverlapRatios: Cannot handle pebble-based contact types.'
+    end_if
+  end_loop
+  if cntOR # 0 then
+    mp_ORavg = float(sumOR) / float(cntOR)
+  end_if
+end
+;------------------------------------------------
+def ft_setMatBehavior( cSet, prox, fric )
+; Virtual function to set material behavior for existing and future grain-grain contacts
+; to be that of a given material.
+;
+; PARAMS:
+;   cSet : contact set ('existing', 'future') to which properties will be assigned [string]
+;          Future contacts are those that may form during subsequent motion.
+;   prox : insure that contacts will be created for pieces within this distance of one another [float]
+;          If cSet == 'future' then use this parameter.
+;   fric : friction coefficient [float]
+;          If fric == -99.0 then use the material property; otherwise, use this parameter.
+;
+; IN (material properties, one of which is friction coefficient):
+;   To be provided by redefined function.
+;
+  util.error = 'The FISH function ft_setMatBehavior is a virtual function that must be redefined.'
+end
+;------------------------------------------------
+def ft_setMatBehavior( cSet, prox, fric )
+; Redefined function to set material behavior for existing and future grain-grain contacts
+; to be that of the linear material.
+;
+; PARAMS (see virtual function ft_setMatBehavior)
+;
+; IN (material properties, one of which is friction coefficient):
+;   lnm_emod : effective modulus [float]
+;   lnm_krat : stiffness ratio [float]
+;   lnm_fric : friction coefficient [float]
+;
+  local cmName
+  if      cm_matType == 0 then ; linear material
+    cmName = 'linear'
+  else if cm_matType == 1 then ; contact-bonded material
+    cmName = 'linearcbond'
+  else if cm_matType == 2 then ; parallel-bonded material
+    cmName = 'linearpbond'
+  else if cm_matType == 3 then ; flat-jointed material
+    cmName = 'linear'
+  else                         ; user-defined material
+    util.error = 'A redefined ft_setMatBehavior must be provided for user-defined material.'
+  end_if
+  ;
+  local theFric
+  if fric == -99.0 then
+    theFric = lnm_fric
+  else
+    theFric = fric
+  end_if
+  _mpSetEffLinBehavior( cSet, prox, lnm_emod, lnm_krat, theFric, 'grain-grain', cmName )
+end
+;------------------------------------------------
+def ft_setGrainWallBehavior( cSet, prox, emod, krat, fric, cmName )
+; Set material behavior for existing and future grain-wall contacts to be that of
+; a linear-based material.
+; PARAMS:
+;   {cSet, prox, emod, krat, fric} : see ft_setMatBehavior
+;   cmName : see _mpSetEffLinBehavior
+;
+  _mpSetEffLinBehavior( cSet, prox, emod, krat, fric, 'grain-wall', cmName )
+end
+;------------------------------------------------
+def ft_SmoothGrainWallInterface
+; For all grain-wall contacts with a negative contact gap, set the reference gap equal to
+; the contact gap. This will establish reference surfaces that are just touching and effectively
+; remove the overlap --- as if we cut off the part of each ball or pebble that protrudes outside
+; of the wall.
+;
+  loop foreach local cp contact.list.all
+    if ft_cGrainWall(cp) then
+      if contact.gap(cp) < 0.0 then
+        contact.prop(cp, 'rgap') = contact.gap(cp) ; remove overlap
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def ft_mBonded
+; Return true if a bonded material is being created.
+  if cm_matType == 1 then
+    ft_mBonded = true
+  else if cm_matType == 2 then
+    ft_mBonded = true
+  else if cm_matType == 3 then
+    ft_mBonded = true
+  else
+    ft_mBonded = false
+  end_if
+end
+;------------------------------------------------
+def ft_bNumBond( bp )
+; Return number of intact bonds of ball bp.
+;
+  if ft_mBonded then ; bonded material
+    local numBond = 0
+    loop foreach local cp ball.contactmap(bp)
+      case_of cm_matType
+        case 1 ; contact-bonded material
+          if contact.model(cp) == 'linearcbond' then
+            if contact.prop(cp, 'cb_state') == 3 then
+              numBond = numBond + 1
+            end_if
+          end_if
+        case 2 ; parallel-bonded material
+          if contact.model(cp) == 'linearpbond' then
+            if contact.prop(cp, 'pb_state') == 3 then
+              numBond = numBond + 1
+            end_if
+          end_if
+        case 3 ; flat-jointed material
+          if contact.model(cp) == 'flatjoint' then
+            local nE
+            if global.dim == 3 then
+              nE = contact.prop(cp, 'fj_nr') * contact.prop(cp, 'fj_nal')
+            else ; 2D model
+              nE = contact.prop(cp, 'fj_nr')
+            end_if
+            loop for ( local e = 1, e <= nE, e = e + 1 )
+              contact.prop(cp, 'fj_elem') = e
+              if contact.prop(cp, 'fj_state') == 3 then
+                numBond = numBond + 1
+              end_if
+            end_loop
+          end_if
+      end_case
+    end_loop
+    ft_bNumBond = numBond
+  else
+    ft_bNumBond = 0
+  end_if
+end
+;------------------------------------------------
+def ft_cGrainGrain(cp)
+  local cGrainGrain = false
+  if      type.pointer.id(cp) == contact.typeid('ball-ball')     then
+    cGrainGrain = true
+  else if type.pointer.id(cp) == contact.typeid('ball-pebble')   then
+    cGrainGrain = true
+  else if type.pointer.id(cp) == contact.typeid('pebble-pebble') then
+    cGrainGrain = true
+  end_if
+  ft_cGrainGrain = cGrainGrain
+end
+;------------------------------------------------
+def ft_cGrainWall(cp)
+  local cGrainWall = false
+  if      type.pointer.id(cp) == contact.typeid('ball-facet')   then
+    cGrainWall = true
+  else if type.pointer.id(cp) == contact.typeid('pebble-facet') then
+    cGrainWall = true
+  end_if
+  ft_cGrainWall = cGrainWall
+end
+;------------------------------------------------
+def ft_cLinearBased( cp )
+; Return true if cp is a linear-based contact.
+;
+  local bLinearBased = false
+  if      contact.model(cp) == 'linear'      then
+    bLinearBased = true
+  else if contact.model(cp) == 'linearcbond' then
+    bLinearBased = true
+  else if contact.model(cp) == 'linearpbond' then
+    bLinearBased = true
+  end_if
+  ft_cLinearBased = bLinearBased
+end
+;------------------------------------------------
+def ft_cBondable( cp )
+; Return true if cp is parallel-bonded, contact-bonded or flat-jointed contact.
+;
+  local bBondable = false
+  if      contact.model(cp) == 'linearcbond' then
+    bBondable = true
+  else if contact.model(cp) == 'linearpbond' then
+    bBondable = true
+  else if contact.model(cp) == 'flatjoint'   then
+    bBondable = true
+  end_if
+  ft_cBondable = bBondable
+end
+;------------------------------------------------
+def ft_cBondIt( cp )
+; Invokes the bond method of the linear contact bond, linear parallel bond or flat joint models such that
+; the interface, second interface or all elements (respectively) will become bonded.
+;
+  if ft_cBondable( cp ) then
+    local gapInterval = vector( -1e20, 1e20 )
+    local args = array.create(1,2)
+          args(1,1) = 'gap'
+          args(1,2) = gapInterval
+    contact.method(cp, 'bond', args)
+  end_if
+end
+;------------------------------------------------
+def ft_cAssignLinProps( cp, emod, krat, fric )
+  contact.prop(   cp, 'fric') = fric
+  contact.inherit(cp, 'fric') = off
+  contact.prop(cp, 'rgap'    ) = 0.0
+  contact.prop(cp, 'lin_mode') = 0
+  local args = array.create(2,2)
+        args(1,1) = 'emod'
+        args(1,2) = emod
+        args(2,1) = 'krat'
+        args(2,2) = krat
+  contact.method(cp, 'deformability', args) ; sets {kn,ks} inherit=off
+  contact.prop(cp, 'dp_nratio') = 0.0
+  contact.prop(cp, 'dp_sratio') = 0.0
+  contact.prop(cp, 'dp_mode'  ) = 0
+end
+;************************************************
+; Bond coordination number measurement, public functions: bcn.
+def bcnMeasure
+; Measure the bond coordination number of grain sample. The bond coordination number is the
+; average number of intact bonds per grain. The grain sample consists of grains (balls or clumps)
+; with a 'bcnMark' property set to 'BCNsample'. Grains are marked via @bcnMark. The grains in the
+; sample can be displayed with the ball and clump plot items by specifying: {ColorBy: Text Val:
+; bcnMark}.
+;
+; OUT: bcn_numGrains - number of grains in the grain sample
+;      mp_CNb        - bond coordination number of grain sample
+;
+  if cm_shape == 1 then
+    util.error = 'bcnMeasure does not yet support clumps.'
+  end_if
+  ;
+  bcnMark
+  ;
+  bcn_numGrains = 0
+  local nBonds = 0
+  loop foreach local bp ball.list
+    if ball.prop(bp, 'bcnMark') == 'BCNsample' then
+      bcn_numGrains = bcn_numGrains + 1
+      nBonds = nBonds + ft_bNumBond( bp )
+    end_if
+  end_loop
+  if bcn_numGrains # 0 then
+    bcnMeasure = float(nBonds) / float(bcn_numGrains)
+  end_if
+end
+;------------------------------------------------
+def bcnMark
+; Define the grain sample used by bcnMeasure. Redefine this function for user-defined marking.
+;
+; EFFECT: 'bcnMark' property of all grains is set to either 'BCNsample' or 'notBCNsample'
+;
+  loop foreach local bp ball.list
+    ball.prop( bp, 'bcnMark' ) = 'notBCNsample'
+    ; Place if-test here for user-defined marking
+    if 1 == 1 then  ; Mark all balls
+      ball.prop( bp, 'bcnMark' ) = 'BCNsample'
+    end_if
+  end_loop
+end
+;************************************************
+; Grain size distribution measurement, public functions gsd_X, private functions _gsdX.
+def gsdMeasure( numBins )
+; Measure the grain size distribution (GSD) of grain sample. The grain sample consists of grains
+; (balls or clumps) with the 'gsdMark' property set to 'GSDsample'. Grains are marked via @gsdMark.
+; The grains in the sample can be displayed with the ball and clump plot items by specifying:
+; {ColorBy: Text Val: gsdMark}.
+;
+; PARAMS:
+;   numBins: number of bins in which to express the GSD (GSD table will have numBins+1 slots)
+;              If all grains are same size, then setting numBins odd will make grain size fall
+;              in middle of a bin; otherwise, grain size will fall on bin boundary.
+;              It is more clear to have the grain size fall in middle of a bin.
+;            
+; OUT: _gsdCalled    - gsdMeasure has been called (boolean)
+;      gsd_numGrains - number of grains in the grain sample
+;      GSD,
+;      GSD-retained - name of tables in which GSD info. is stored
+;                       x-value is {grain size (mm)} in range [dmin, dmax], where d{min,max} is
+;                         {min, max} grain diameter of sampled grains; and
+;                       y-value is
+;                         GSD         : cumulative  mass percent passing  {mass passing (%)}
+;                                       y-value in [0.0, 100.0]
+;                         GSD-retained: incremental mass percent retained {mass (%)}
+;                       The tables have numBins+1 slots s.t. mass passing is zero at grain size
+;                       of dmin.
+;
+  if numBins < 2 then
+    util.error = 'gsdMeasure: numBins must be greater than or equal to two.'
+  end_if
+  ;
+  if _gsdCalled == false then ; first call to gsdMeasure
+    local tp = table.create( 'GSD' )
+          tp = table.create( 'GSD-retained' )
+  else
+    table.clear( 'GSD' )
+    table.clear( 'GSD-retained' )
+  end_if
+  _gsdCalled = true
+  loop local i (1, numBins+1)  ; Initialize tables with (0,0) in all slots.
+    table.value( 'GSD'         , i ) = [vector(0.0,0.0)]
+    table.value( 'GSD-retained', i ) = [vector(0.0,0.0)]
+  end_loop
+  ;
+  gsdMark
+  _gsdMakeGSDretained( numBins )
+  _gsdMakeGSD
+end
+;------------------------------------------------
+def gsdMark
+; Define the grain sample used by gsdMeasure. Redefine this function for user-defined marking.
+;
+; EFFECT: 'gsdMark' property of all grains is set to either 'GSDsample' or 'notGSDsample'
+;
+  loop foreach local bp ball.list
+    ball.prop( bp, 'gsdMark' ) = 'notGSDsample'
+    ; Place if-test here for user-defined marking
+    if 1 == 1 then  ; Mark all balls
+      ball.prop( bp, 'gsdMark' ) = 'GSDsample'
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def gsdGetSizeOfPercentile( pct )
+; Return grain size corresponding to percentile {pct}, for grain size distribution in GSD table.
+; The returned value is linearly interpolated from the table values.
+; PARAM:
+;   pct : percentile in range [0.0, 100.0]
+;
+; IN: GSD table
+;
+  local numSlots = table.size( 'GSD' )
+  if numSlots = 0 then
+    util.error = 'gsdGetSizeOfPercentile: number of slots in table GSD is zero.'
+  end_if
+  if (pct < 0.0) | (pct > 100.0) then 
+    util.error = 'gsdGetSizeOfPercentile: parameter pct must be in range [0.0, 100.0].'
+  end_if  
+  ;
+  local x0, x1, y0, y1
+  loop local i (2, numSlots)
+    y1 = table.y( 'GSD', i )  
+    if y1 >= pct then
+      x0 = table.x( 'GSD', i-1 )
+      y0 = table.y( 'GSD', i-1 )
+      x1 = table.x( 'GSD', i )
+      exit loop
+    end_if
+  end_loop
+  if math.abs( y1 - y0 ) >= _ftCheckZeroTol then
+    gsdGetSizeOfPercentile = x0  +  ( (x1 - x0) / (y1 - y0) ) * (pct - y0) 
+  else
+    gsdGetSizeOfPercentile = x0
+  end_if
+end
+;------------------------------------------------
+def _gsdMakeGSDretained( numBins )
+; Make GSD-retained table.
+;
+; OUT: GSD-retained (table)
+;      gsd_numGrains
+;
+  _gsdBounds ;{o: _gsdDmin, _gsdDmax}
+  local eps
+  if math.abs(_gsdDmax - _gsdDmin) > 1.0e-6 then
+    eps = 0.01 * ( (_gsdDmax - _gsdDmin)/numBins )
+  else
+    eps = 0.01 * _gsdDmax
+  end_if
+  local DminMinus = _gsdDmin - eps
+  local DmaxPlus  = _gsdDmax + eps
+  local s         = DmaxPlus - DminMinus ; s > 0
+  local deltaX = float(s / numBins)
+  ;
+  table.x( 'GSD-retained', 1 ) = DminMinus
+  table.y( 'GSD-retained', 1 ) = 0.0
+  loop local slt (2, numBins+1)
+    table.x( 'GSD-retained', slt ) = table.x( 'GSD-retained', slt-1 ) + deltaX
+    table.y( 'GSD-retained', slt ) = 0.0
+  end_loop
+  ;
+  local cntG = 0
+  local sumMass = 0.0
+  loop foreach local bp ball.list
+    if ball.prop(bp, 'gsdMark') == 'GSDsample' then
+      cntG = cntG + 1
+      local diam = 2.0 * ball.radius(bp)
+      local mass = ball.mass.real(bp)
+      local xi = (diam - DminMinus) / s  ; s > 0 because of its definition above
+      slt = int( xi * numBins ) + 2
+      table.y( 'GSD-retained', slt ) = table.y( 'GSD-retained', slt ) + mass
+      sumMass = sumMass + mass
+    end_if
+  end_loop
+  ; Normalize by total mass, to get mass percent.
+  if sumMass < 1.0e-6 then
+    util.error = '_gsdMakeGSDretained: sumMass is zero.'
+  end_if
+  loop slt (1, numBins+1)
+    table.y( 'GSD-retained', slt ) = 100.0 * (table.y( 'GSD-retained', slt ) / sumMass)
+  end_loop
+  gsd_numGrains = cntG
+end
+;------------------------------------------------
+def _gsdBounds  ;{o: _gsdDmin, _gsdDmax}
+  local Dmin = 1.0e20
+  local Dmax = 0.0
+  loop foreach local bp ball.list
+    if ball.prop(bp, 'gsdMark') == 'GSDsample' then
+      local diam = 2.0 * ball.radius(bp)
+      Dmin = math.min( Dmin, diam )
+      Dmax = math.max( Dmax, diam )
+    end_if
+  end_loop
+  _gsdDmin = Dmin
+  _gsdDmax = Dmax
+end
+;------------------------------------------------
+def _gsdMakeGSD
+; Make GSD table, assuming that GSD-retained table is valid.
+;
+; IN:  GSD-retained table
+; OUT: GSD table
+;
+  local numSlots = table.size( 'GSD-retained' )
+  loop local i (1, numSlots)
+    table.x( 'GSD', i ) = table.x( 'GSD-retained', i )
+    table.y( 'GSD', i ) = 0.0
+  end_loop
+  table.y( 'GSD', 1 ) = table.y( 'GSD-retained', 1 )
+  loop i (2, numSlots) 
+    table.y( 'GSD', i ) = table.y( 'GSD', i-1 ) + table.y( 'GSD-retained', i )
+  end_loop
+end
+;************************************************
+def mpMake( justGrains, msActivate )
+; Make the material. If justGrains = 1, then only make the grains and list their
+; microstructural properties. This allows one to establish the relationship between
+; diameter muliplier (cm_Dmult) and vessel resolution. After the desired
+; resolution is obtained, then make the material by setting justGrains = 0.
+; PARAM:
+;  justGrains : {0, 1} = {Make the material & continue, Determine vessel resolution & stop}
+;  msActivate : If true, then activate microstructural plotting (by calling msOn).
+;               Boolean parameter that must be surrounded by square brackets when calling
+;               mpMake --- for example, mpMake( 0, [true] ).
+;
+; IN:  {common, packing and material parameters}, msActivate
+; OUT: Saved States (with corresponding model titles):
+;        <cm_matName>-{matV : material in material vessel
+;                      mat  : material removed from material vessel (if bonded material)}
+;      mpGrp(i) : group name of grains in sizeDist-i, i=1,2,...,cm_nSD
+;                   The names are <cm_matName>-SD<i>, e.g., Class5_dense-SD1.
+;
+  ft_SetTitle( ['Making ' + cm_matName + ' material...'] )
+  ;
+  local myStr = '## mpMake, '
+  if justGrains # 0 then
+    myStr = myStr + 'Determining vessel resolution'
+  else
+    myStr = myStr + 'Making the material and continuing'
+  end_if
+  myStr = myStr + ' (entering).'
+  io.out( myStr )
+  ;
+  ; *** Temporary checks, for functionality not yet implemented.
+  if mv_type # 0 then
+    util.error = 'mpMake: Periodic vessel not yet implemented.'
+  end_if
+  if cm_shape # 0 then
+    util.error = 'mpMake: All-clumps material is not yet available.'
+  end_if
+  ;
+  if cm_matType == 4 then ; user-defined material
+    command
+      load contactmodelmechanical [cm_modName]
+    end_command
+  end_if
+  ;
+  ; *** Make the grains, specify their density and local-damping factor.
+  _mpMakeGrains( pk_seed, pk_nc )
+  _mpSetGrainDensity
+  _mpSetGrainDamp( cm_localDampFac )
+  if justGrains # 0 then
+    mpListMicroStrucProps
+    util.error = 'Stopping as planned, microstructural properties have been listed above.'
+  end_if
+  gsdMeasure( 79 ) ; create GSD table for display
+  ;
+  ; *** Perform material genesis, then save model.
+  _mpPackingPhase
+  _mpFinalizationPhase
+  if msActivate then
+    msOn
+  end_if
+  ft_SetTitle( [cm_matName + ' material in material vessel.'] )
+  ft_SaveState( cm_matName, 'matV' )
+  ;
+  ; *** If a bonded material, then
+  ;     remove from material vessel and allow to relax, and save model.
+  if ft_mBonded then ; bonded material
+    mv_wRemove
+    ft_eq( pk_ARatLimit, pk_stepLimit )
+    command
+      history reset
+    end_command
+    if global.dim == 3 then
+      command
+        ball attribute displacement (0.0,0.0,0.0)
+      end_command
+    else ; 2D model
+      command
+        ball attribute displacement (0.0,0.0)
+      end_command
+    end_if
+    msForceUpdate
+    ft_SetTitle( [cm_matName + ' material removed from material vessel.'] )
+    ft_SaveState( cm_matName, 'mat' )
+  end_if
+  io.out('## mpMake (exiting).')
+end
+;------------------------------------------------
+def _mpSetEffLinBehavior( cSet, prox, emod, krat, fric, cType, cmName )
+; Set material behavior for existing and future contacts to be that of a linear-based material.
+; PARAMS:
+;   {cSet, prox} : see virtual function ft_setMatBehavior
+;   emod   : effective modulus [float]
+;   krat   : stiffness ratio [float]
+;   fric   : friction coefficient [float]
+;   cType  : contact type ('grain-grain', 'grain-wall') [string]
+;   cmName : contact model name ('linear', 'linearcbond', 'linearpbond') [string]
+;
+  if      cSet == 'existing' then
+  else if cSet == 'future'   then
+  else
+    util.error = '_mpSetEffLinBehavior cannot handle specified value for parameter cSet.'
+  end_if
+  if      cType == 'grain-wall'  then
+  else if cType == 'grain-grain' then
+  else
+    util.error = '_mpSetEffLinBehavior cannot handle specified value for parameter cType.'
+  end_if
+  if      cmName == 'linear'      then
+  else if cmName == 'linearcbond' then
+  else if cmName == 'linearpbond' then
+  else
+    util.error = '_mpSetEffLinBehavior cannot handle specified value for parameter cmName.'
+  end_if
+  ;
+  local myTypeStr = array.create(3)
+  local tidx, tidxMax
+  if cType == 'grain-grain' then
+    myTypeStr(1) = 'ball-ball'
+    myTypeStr(2) = 'ball-pebble'
+    myTypeStr(3) = 'pebble-pebble'
+    tidxMax = 3
+  else ; cType == 'grain-wall'
+    myTypeStr(1) = 'ball-facet'
+    myTypeStr(2) = 'pebble-facet'
+    tidxMax = 2
+  end_if
+  if cSet == 'existing' then
+    loop for ( tidx = 1, tidx <= tidxMax, tidx = tidx + 1 )
+      command
+        contact method deformability emod [emod] krat [krat]             range contact type [myTypeStr(tidx)]
+        contact property fric [fric] inheritance off ...
+                         rgap 0.0 lin_mode 0 dp_nratio 0.0 dp_sratio 0.0 range contact type [myTypeStr(tidx)]
+      end_command
+    end_loop
+  else ; cSet = 'future'
+    loop for ( tidx = 1, tidx <= tidxMax, tidx = tidx + 1 )
+      command
+        cmat default type [myTypeStr(tidx)] ...
+                     model [cmName] ...
+                     method deformability emod [emod] krat [krat] ...
+                     property fric [fric] inheritance off rgap 0.0 lin_mode 0 dp_nratio 0.0 dp_sratio 0.0 ...
+                     proximity [prox]
+      end_command
+    end_loop
+    command
+      clean ; Create contacts between all grains within [prox] of one another.
+    end_command
+  end_if
+end
+;------------------------------------------------
+def _mpPackingPhase
+; Perform material-genesis packing phase.
+;
+; IN: packing parameters
+;
+; The first step of the packing phase has been performed by _mpMakeGrains.
+  _mpPackIsoState
+  if pk_procCode == 0 then ; boundary contraction
+    _mpPackBdryContract
+  else ; grain scaling
+    _mpPackGrainScale
+  end_if
+end
+;------------------------------------------------
+def _mpPackIsoState
+; Enforce linear behavior (with given effective modulus and friction coefficient of zero), and
+; then allow the grains to rearrange until either the mean stress is near zero (within 0.1% of pk_Pm) or
+; static equilibrium is obtained.
+;
+; IN: pk_Pm, mv_wsm
+;     pk_ARatLimit, pk_stepLimit,
+;
+  io.out('## _mpPackIsoState (entering).')
+  local noProx = -99.0
+  ft_setMatBehavior( 'existing', noProx, 0.0 )
+  ft_setMatBehavior(   'future',    0.0, 0.0 )
+  ;
+  io.out('   Perform calming (via cycle calm 5) until max overlap-ratio is small.')
+  _pkORcnt = _pkORupdateRate ; force an update during first cycle
+  command
+    solve fishhalt _mpMaxORisSmall calm 5
+  end_command
+  _mpDeleteGrainsOutOfVessel
+  io.out('   **Calming done, max overlap-ratio: '+ string(ft_maxOverlapRatio))
+  ;
+  io.out('   Cycle until mean stress is near zero or static equilibrium is obtained.')
+  command
+    solve fishhalt _mpMSisNearZero aratio [pk_ARatLimit] max_cycles [pk_stepLimit]
+  end_command
+  _mpDeleteGrainsOutOfVessel
+  if _mpMSisNearZero == 1 then
+    io.out('   **Mean stress is near zero.')
+  else
+    io.out('   **Static equilibrium obtained within desired tolerance.')
+  end_if
+  io.out('## _mpPackIsoState (exiting).')
+end
+;------------------------------------------------
+def _mpMaxORisSmall  ;{i: _pkORmaxLimit, _pkORcnt, _pkORupdateRate}
+  _mpMaxORisSmall = 0
+  _pkORcnt = _pkORcnt + 1
+  if _pkORcnt >= _pkORupdateRate then
+    ft_OverlapRatios
+          io.out('   max overlap-ratio limit: '+string(_pkORmaxLimit))
+          io.out('   max overlap-ratio      : '+string(mp_ORmax))
+    if mp_ORmax <= _pkORmaxLimit then
+      _mpMaxORisSmall = 1
+    end_if
+    _pkORcnt = 0
+  end_if
+end
+;------------------------------------------------
+def _mpMSisNearZero
+  if mv_wsm >= -1e-3*pk_Pm then  ; Mean stress will be negative until the assembly unloads.
+                                 ; Unloaded if mean stress is 0.1% of pk_Pm.
+    _mpMSisNearZero = 1
+  else
+    _mpMSisNearZero = 0
+  end_if
+end
+;------------------------------------------------
+def _mpDeleteGrainsOutOfVessel
+  if mv_type == 1 then
+    exit  ; periodic vessel has no outside
+  end_if
+  ;
+  local numGrains0 = ball.num + clump.num
+  if mv_shape == 0 then
+    if global.dim == 3 then
+      command
+        ball delete range x [-0.5*mv_D] [0.5*mv_D] not
+        ball delete range y [-0.5*mv_W] [0.5*mv_W] not
+        ball delete range z [-0.5*mv_H] [0.5*mv_H] not
+      end_command
+    else ; 2D model
+      command
+        ball delete range x [-0.5*mv_W] [0.5*mv_W] not
+        ball delete range y [-0.5*mv_H] [0.5*mv_H] not
+      end_command
+    end_if
+  else if mv_shape == 1
+    command
+      ball delete range cylinder end1 (0.0, 0.0, [-0.5*mv_H]) ...
+                                 end2 (0.0, 0.0, [ 0.5*mv_H]) ...
+                                 radius [0.5*mv_W]            ...
+                                 not
+    end_command
+  else ; mv_shape == 2
+    command
+      ball delete range sphere center (0.0, 0.0, 0.0) ...
+                               radius [0.5*mv_H]      ...
+                               not
+    end_command
+  end_if
+  local numGrains1 = ball.num + clump.num
+  local numDel = numGrains0 - numGrains1
+  if numDel > 0 then
+    io.out('   **Deleted ' + string(numDel) + ' grains with centers outside of material vessel.')
+  end_if
+end
+;------------------------------------------------
+def _mpPackBdryContract
+; Enforce linear behavior (with given parameters), and then apply confinement of pk_Pm.
+; Confinement is applied via the servomechanism until the wall pressures are within
+; pk_PTol of pk_Pm. De-activate the servomechanism (insuring that all wall velocities
+; are zero).
+;
+  io.out('## _mpPackBdryContract (entering).')
+  local noProx = -99.0
+  ft_setMatBehavior( 'existing', noProx, pk_fricCA )
+  ft_setMatBehavior(   'future',    0.0, pk_fricCA )
+  ;
+  mvs_vLimit = pk_vLimit
+  mvs_on
+  mv_mStrainZero
+  mv_wStrainZero
+  mvs_applyConfinement( pk_Pm, pk_PTol, pk_ARatLimit, pk_stepLimit )
+  mvs_off
+  io.out('## _mpPackBdryContract (exiting).')
+end
+;------------------------------------------------
+def _mpPackGrainScale
+; Scale the grain size iteratively to modify the mean stress of the assembly until the
+; mean stress is within pk_PTol of pk_Pm.
+;
+; IN: pk_Pm, pk_PTol, pk_ARatLimit, pk_stepLimit
+;
+  io.out('## _mpPackGrainScale (entering).')
+  ;
+  if _mpMSisNearZero == 1 then
+    util.error = 'Mean stress is near zero, grain-scaling proc. must begin with a tight pack.'
+  end_if
+  ;
+  _GSiterN = 0
+  _GSaccumSFac = 1.0
+  loop while _GSPMet( pk_Pm, pk_PTol ) # 1
+    _GSapplyAlpha( _GSgetAlpha ) ;{o: _GSiterN, _GSaccumSFac}
+    io.out('   Cycle until mean stress is near zero or static equilibrium is obtained.')
+    command
+      cycle 10 ; propagate effect of radius change
+      solve fishhalt _mpMSisNearZero aratio [pk_ARatLimit] max_cycles [pk_stepLimit]
+    end_command
+    if _mpMSisNearZero == 1 then
+      util.error = 'Mean stress is now near zero, this situation is not yet handled [try to reduce pk_ARatLimit].'
+    else
+      io.out('   **Static equilibrium obtained within desired tolerance.')
+    end_if
+  end_loop
+  ;
+  io.out('## _mpPackGrainScale (exiting)')
+end
+;------------------------------------------------
+def _GSPMet( Pm, PTol )
+; Returns 1 iff current material pressure (-mv_wsm) is within pressure tolerance [PTol] of [Pm].
+  local P = -mv_wsm
+  local epsP = math.abs( P - Pm ) / Pm
+  io.out('   Target  material pressure: '+string(Pm))
+  io.out('   Current material pressure: '+string(P))
+  io.out('   Target  pressure tolerance: '+string(PTol))
+  io.out('   Current pressure tolerance: '+string(epsP))
+  if epsP <= PTol then
+    _GSPMet = 1
+    io.out('   **Target pressure achieved within desired tolerance.')
+  else
+    _GSPMet = 0
+  end_if
+end
+;------------------------------------------------
+def _GSgetAlpha
+  local _denom = 0.0
+  loop foreach local bp ball.list ; all balls in model
+    loop foreach local cp ball.contactmap(bp) ; all active contacts of ball bp
+      local Rcp = math.mag( contact.pos(cp) - ball.pos(bp) )
+      local Kn = contact.prop(cp, 'kn')
+      local Phi = ball.radius(bp)
+      ; The contact type must be ball-ball, ball-pebble or ball-facet.
+      if type.pointer.id(cp) == contact.typeid('ball-pebble') then
+        util.error = '_GSgetAlpha: cannnot yet handle case of ball-pebble contact.'
+      end_if
+      ; The contact type must be ball-ball or ball-facet.
+      if type.pointer.id(cp) == contact.typeid('ball-ball') then
+        local bpo
+        if contact.end1(cp) == bp then
+          bpo = contact.end2(cp)
+        else
+          bpo = contact.end1(cp)
+        end_if
+        Phi = Phi + ball.radius(bpo)
+      end_if
+      _denom = _denom + (Rcp * Kn * Phi)
+    end_loop
+  end_loop
+  local delMS = -pk_Pm - mv_wsm
+  if _denom == 0.0 then
+    _GSgetAlpha = 0.0
+  else
+    _GSgetAlpha = -float(global.dim) * _mvVolume(true) * delMS / _denom
+  end_if
+end
+;------------------------------------------------
+def _GSapplyAlpha( alpha ) ;{o: _GSiterN, _GSaccumSFac}
+  _GSiterN = _GSiterN + 1
+  local sFac = 1.0 + alpha
+  _GSaccumSFac = _GSaccumSFac * sFac
+  ;
+  io.out('     Iteration: '+string(_GSiterN))
+  io.out('     Scaling grains by factor: '+string(sFac))
+  io.out('           Accumulated factor: '+string(_GSaccumSFac))
+  ;
+  loop foreach local bp ball.list
+    ball.radius(bp) = sFac * ball.radius(bp)
+  end_loop
+end
+;------------------------------------------------
+def _mpFinalizationPhase
+; Perform material-genesis finalization phase.
+;
+; IN: cm_matType, material parameters
+;
+  ; Assign final material properties to existing grain-grain contacts, and
+  ; specify material properties for future grain-grain contacts.
+  ; For the bonded materials, 
+  ;   (1) Create contacts between all grains within the installation-gap distance of one another,
+  ;   (2) assign final material properties to all contacts.
+  ; We then return proximity to zero for all future contacts.
+  local noProx = -99.0
+  local noFric = -99.0
+  case_of cm_matType
+    case 0 ; linear material
+      ft_setMatBehavior( 'existing',   noProx, noFric )
+    case 1 ; contact-bonded material
+      ft_setMatBehavior(   'future', cbm_igap, noFric )
+      _mpAssignCB
+    case 2 ; parallel-bonded material
+      ft_setMatBehavior(   'future', pbm_igap, noFric )
+      _mpAssignPB
+    case 3 ; flat-jointed material
+      ft_setMatBehavior(   'future', fjm_igap, noFric )
+      _mpAssignFJ
+    case 4 ; user-defined material
+      ft_setMatBehavior( 'existing',   noProx, noFric )
+  end_case
+  ft_setMatBehavior( 'future', 0.0, noFric )
+  ;
+  ; Remove resultant force/moment in grains from previous cycle, and set grain velocities to zero.
+  if global.dim == 3 then
+    command
+      ball attribute contactforce (0.0,0.0,0.0)  contactmoment (0.0,0.0,0.0)
+      ball attribute velocity     (0.0,0.0,0.0)  spin          (0.0,0.0,0.0)
+      ball attribute displacement (0.0,0.0,0.0)
+    end_command
+  else ; 2D  model
+    command
+      ball attribute contactforce (0.0,0.0)  contactmoment 0.0
+      ball attribute velocity     (0.0,0.0)  spin          0.0
+      ball attribute displacement (0.0,0.0)
+    end_command
+  end_if
+  if ft_mBonded then ; bonded material
+    ft_SmoothGrainWallInterface
+  end_if
+  ft_eq( pk_ARatLimit, pk_stepLimit ) ; Bring system back to equilibrium.
+end
+;------------------------------------------------
+def _mpAssignPB
+; Assign parallel-bonded material properties (linear and parallel-bond groups) to all grain-grain contacts,
+; but only bond the contacts with a gap less than or equal to pbm_igap.
+; The reference gap for the linear component of the linear parallel bond contact model
+; is zero unless a bond is installed. If a bond is installed and the contact gap is negative, then
+; the reference gap is set equal to the contact gap at the time of bond installation.
+;
+; IN: parallel-bonded material parameters
+;
+  loop foreach local cp contact.list.all
+    if ft_cGrainGrain(cp) then
+      ft_cAssignLinProps( cp, pbm_emod, pbm_krat, pbm_fric )
+      _mpAssignPBprops(cp)
+      if contact.gap(cp) <= pbm_igap then
+        _mpAssignPBbond( cp )
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _mpAssignCB
+; Assign contact-bonded material properties (linear and contact-bond groups) to all grain-grain contacts,
+; but only bond the contacts with a gap less than or equal to cbm_igap.
+; The reference gap is zero unless a bond is installed. If a bond is installed, then the reference gap
+; is set equal to the contact gap at the time of bond installation.
+;
+; IN: contact-bonded material parameters
+;
+  loop foreach local cp contact.list.all
+    if ft_cGrainGrain(cp) then
+      ft_cAssignLinProps( cp, cbm_emod, cbm_krat, cbm_fric )
+      if contact.gap(cp) <= cbm_igap then
+        _mpAssignCBbond( cp )
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _mpAssignFJ
+; Install flat-joint contact model at all grain-grain contacts with a gap less than or equal to fjm_igap,
+; and assign flat-jointed material properties to these flat-jointed contacts.
+; The remaining grain-grain contacts already possess the linear contact model and are assigned
+; properties derived from the linear material group of the flat-jointed material properties.
+;
+; IN: flat-jointed material parameters
+;
+  loop foreach local cp contact.list.all
+    if ft_cGrainGrain(cp) then
+      if contact.gap(cp) <= fjm_igap then
+        contact.model(cp) = 'flatjoint'
+        _mpAssignFJprops(cp)
+      else
+        ft_cAssignLinProps( cp, lnm_emod, lnm_krat, lnm_fric )
+      end_if
+    end_if
+  end_loop
+  if fjm_rmulCode == 1 then
+    _mpFJrmulReduce
+  end_if
+  _mpFJsetMicroStruc
+end
+;------------------------------------------------
+def _mpAssignFJProps( cp )  ; cp is a flat-jointed contact
+  if contact.model(cp) # 'flatjoint' then
+    util.error = '_mpAssignFJProps operating on a non flat-jointed contact.'
+  end_if
+  ;
+  contact.prop( cp, 'fj_nr'   ) = fjm_Nr
+  if global.dim == 3 then
+    contact.prop( cp, 'fj_nal'  ) = fjm_Nal
+  end_if
+  contact.prop( cp, 'fj_rmul' ) = fjm_rmulVal
+  contact.prop( cp, 'fj_fric' ) = fjm_fric
+  contact.prop( cp, 'fj_ten'  ) = ft_valNormDist( fjm_ten_m, fjm_ten_sd )
+  contact.prop( cp, 'fj_coh'  ) = ft_valNormDist( fjm_coh_m, fjm_coh_sd )
+  contact.prop( cp, 'fj_fa'   ) = fjm_fa
+  local args = array.create(2,2)
+        args(1,1) = 'emod'
+        args(1,2) = fjm_emod
+        args(2,1) = 'krat'
+        args(2,2) = fjm_krat
+  contact.method(cp, 'deformability', args)
+end
+;------------------------------------------------
+def _mpFJrmulReduce
+  ; Perform radius-reduction algorithm on all flat-jointed contacts to obtain a valid microstructure.
+  ; NOT YET IMPLEMENTED, has been implemented for PFC2D 4.0 and has been derived for PFC3D as well.
+end
+;------------------------------------------------
+def _mpFJsetMicroStruc
+; Create the flat-jointed microstructure such that each flat joint is either
+;   bonded (g_o = 0, bonded), gapped (g_o > 0, unbonded) or slit (g_o = 0, unbonded).
+;
+; IN: fjm_B_frac, fjm_G_frac, fjm_G_{m,sd}
+;
+  local nFJ = 0  
+    loop foreach local cp contact.list.all
+      if contact.model(cp) == 'flatjoint' then
+        nFJ = nFJ + 1
+      end_if
+    end_loop
+  local nB  = math.round( fjm_B_frac * nFJ )
+  local nG  = math.round( fjm_G_frac * nFJ )
+  local nS  = nFJ - nB - nG
+  local nC = 0
+  loop foreach cp contact.list.all
+    if contact.model(cp) == 'flatjoint' then
+      nC = nC + 1
+      if nC <= nB then           ; *** make bonded
+        local makeB = makeB + 1
+        contact.prop(   cp, 'fj_gap0' ) = 0.0
+        ft_cBondIt(     cp )
+      else if nC <= (nB+nG) then ; *** make gapped
+        local makeG = makeG + 1
+        contact.prop(   cp, 'fj_gap0' ) = ft_valNormDist( fjm_G_m, fjm_G_sd )
+      else                       ; *** make slit
+        local makeS = makeS + 1
+        contact.prop(   cp, 'fj_gap0' ) = 0.0
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _mpAssignPBprops( cp )
+  ; Parallel-bond group:
+  contact.prop(cp, 'pb_rmul') = pbm_rmul
+  local args = array.create(2,2)
+        args(1,1) = 'emod'
+        args(1,2) = pbm_bemod
+        args(2,1) = 'krat'
+        args(2,2) = pbm_bkrat
+  contact.method(cp, 'pb_deformability', args)
+  contact.prop(cp,   'pb_mcf') = pbm_mcf
+  contact.prop(cp,   'pb_ten') = ft_valNormDist( pbm_ten_m, pbm_ten_sd )
+  contact.prop(cp,   'pb_coh') = ft_valNormDist( pbm_coh_m, pbm_coh_sd )
+  contact.prop(cp,   'pb_fa' ) = pbm_fa
+end
+;------------------------------------------------
+def _mpAssignPBbond( cp )
+  ft_cBondIt( cp )
+  if contact.gap(cp) < 0.0 then  ; remove overlap only, do not extend surfaces
+    contact.prop(cp, 'rgap') = contact.gap(cp)
+  end_if
+end
+;------------------------------------------------
+def _mpAssignCBbond( cp )
+  ft_cBondIt( cp )
+  local args = array.create(2,2)
+        args(1,1) = 'tensile'
+        args(1,2) = ft_valNormDist( cbm_tens_m,   cbm_tens_sd )
+        args(2,1) = 'shear'
+        args(2,2) = ft_valNormDist( cbm_shears_m, cbm_shears_sd )
+  contact.method(cp, 'cb_strength', args)
+  contact.prop(cp, 'rgap') = contact.gap(cp) ; remove overlap or extend surfaces
+end
+;------------------------------------------------
+def _mpMakeGrains( seed, nc )
+; Generate a cloud of grains with porosity [nc]. This porosity does not account for
+; overlaps: nc = (Vv - Vg)/Vg, where Vv is vessel volume and Vg is total grain volume.
+; The grains are drawn from the specified size distribution, and then placed at arbitrarily
+; chosen positions that lie fully within the material vessel such that there may be large
+; grain-grain overlaps.
+; PARAMS:
+;   seed : seed of random-number generator
+;   nc   : cloud porosity (does not account for overlap)
+;
+  command
+    set random [seed]
+  end_command
+  ;
+  mpGrp = array.create( cm_nSD )
+  local i
+  loop for( i=1, i<=cm_nSD, i=i+1 )
+    mpGrp(i) = cm_matName + '-SD' + string(i)
+  end_loop
+  ;
+  local mySize = 7 + 4*cm_nSD
+  if mv_shape # 0 then ; mv_shape = {1,2}
+    mySize = mySize + 1
+  end_if
+  local myStr = array.create( mySize )
+  myStr(1) = 'ball distribute ...'
+  if global.dim == 3 then
+    myStr(2) = '  box [-0.5*mv_D] [0.5*mv_D] ...'
+    myStr(3) = '      [-0.5*mv_W] [0.5*mv_W] ...'
+    myStr(4) = '      [-0.5*mv_H] [0.5*mv_H] ...'
+  else ; 2D model
+    myStr(2) = '  box [-0.5*mv_W] [0.5*mv_W] ...'
+    myStr(3) = '      [-0.5*mv_H] [0.5*mv_H] ...'
+    myStr(4) = '      ...'
+  end_if
+  myStr(5) = '  porosity [nc] ...'
+  myStr(6) = '  resolution [cm_Dmult]...'
+  myStr(7) = '  numbin [cm_nSD] ...'
+  loop for( i=1, i<=cm_nSD, i=i+1 )
+    local j = 7 + 4*(i-1)
+    myStr(j+1) = string.build('  bin %1 group [mpGrp(%2)] ...',i,i)
+    myStr(j+2) = string.build('        radius [0.5*cm_Dlo(%1)] [0.5*cm_Dup(%2)] ...',i,i)
+    if cm_typeSD(i) == 1 then
+      myStr(j+3) = string.build('        gauss ...')
+    else
+      myStr(j+3) = string.build('        ... ')
+    end_if
+    myStr(j+4) = string.build('        volumefraction [cm_Vfrac(%1)]', i)
+    if i < cm_nSD then  ; Add ellipses for each entry, but not the last one
+      myStr(j+4) = myStr(j+4) + ' ...'
+    end_if
+  end_loop
+  if mv_shape # 0 then ; mv_shape = {1,2}
+    myStr(j+4) = myStr(j+4) + ' ...'  ; add ellipses for previous entry
+    if mv_shape == 1 then
+      myStr(j+5) = '  range fish _mpCylRange'
+    else ; mv_shape = 2
+      myStr(j+5) = '  range fish _mpSphRange'
+    end_if
+  end_if
+  array.command( myStr )
+end
+;------------------------------------------------
+def _mpCylRange( posObj, ptrObj ) ;{i: mv_W, mvWpCyl}
+; Fish range element, returns true if the object (ball or pebble) is fully inside the cylinder
+; wall (which has a polygonal cross section in the xy-plane). The objects lie fully inside the
+; cylinder end caps. The wall facets have normals directed toward outside of cylinder.
+;
+  _mpCylRange = true
+  if type.pointer(ptrObj) == 'ball' then
+    local bp = ptrObj
+    ;
+    ; Test 1: Ball protrudes from true cylinder.
+    local _dbc = math.sqrt( comp.x(posObj)*comp.x(posObj) + comp.y(posObj)*comp.y(posObj) )
+    local Rc = 0.5*mv_W
+    local Rb = ball.radius(bp)
+    if (_dbc + Rb) > Rc then
+      _mpCylRange = false
+      exit
+    end_if
+    ;
+    ; Test 2: Ball center is outside of the nearest facet, thus outside of cylinder.
+    local wf = wall.facet.near( posObj, mvWpCyl )
+    local Pf = wall.facet.pointnear( wf, posObj )
+    local Pbf = posObj - Pf
+    if math.dot( Pbf, wall.facet.normal(wf) ) >= 0.0 then
+      _mpCylRange = false
+      exit
+    end_if
+    ;
+    ; Test 3: Ball protrudes from the facet.
+    if math.mag(Pbf) < Rb then
+      _mpCylRange = false
+      exit
+    end_if
+  else
+    util.error = '_mpCylRange: ptrObj is not a ball.'
+  end_if
+end
+;------------------------------------------------
+def _mpSphRange( posObj, ptrObj ) ;{i: mv_H, mvWpSph}
+; Fish range element, returns true if the object (ball or pebble) is fully inside the sphere wall.
+; The wall facets have normals directed toward inside of sphere.
+;
+  _mpSphRange = true
+  if type.pointer(ptrObj) == 'ball' then
+    local bp = ptrObj
+    ;
+    ; Test 1: Ball protrudes from true sphere.
+    local _dbc = math.sqrt(   comp.x(posObj)*comp.x(posObj) ...
+                            + comp.y(posObj)*comp.y(posObj) ...
+                            + comp.z(posObj)*comp.z(posObj)     )
+    local Rs = 0.5*mv_H
+    local Rb = ball.radius(bp)
+    if (_dbc + Rb) > Rs then
+      _mpSphRange = false
+      exit
+    end_if
+    ;
+    ; Test 2: Ball center is outside of the nearest facet, thus outside of sphere.
+    local wf = wall.facet.near( posObj, mvWpSph )
+    local Pf = wall.facet.pointnear( wf, posObj )
+    local Pbf = posObj - Pf
+    if math.dot( Pbf, wall.facet.normal(wf) ) <= 0.0 then
+      _mpSphRange = false
+      exit
+    end_if
+    ;
+    ; Test 3: Ball protrudes from the facet.
+    if math.mag(Pbf) < Rb then
+      _mpSphRange = false
+      exit
+    end_if
+  else
+    util.error = '_mpSphRange: ptrObj is not a ball.'
+  end_if
+end
+;------------------------------------------------
+def _mpSetGrainDamp( dFac )
+; Set the local-damping factor of all grains to [dFac].
+; MODIFY: local-damping factor of all balls and clumps
+;
+  if ball.num > 0 then
+    command
+      ball attribute damp [dFac]
+    end_command
+  end_if
+  if clump.num > 0 then
+    command
+      clump attribute damp [dFac]
+    end_command
+  end_if
+end
+;------------------------------------------------
+def _mpSetGrainDensity
+; Set the density of all grains.
+;
+; IN:     cm_densityCode, cm_densityVal (see Common Material Parameters)
+;         mv_shape, mv_{W,H,D}
+; MODIFY: density of all balls and clumps
+;
+  local _rhoG, bp, cp
+  if cm_densityCode == 0 then
+    _rhoG = cm_densityVal
+  else ; cm_densityCode = 1
+    local _Vg = 0.0
+    loop foreach bp ball.list
+      local _bVol
+      if global.dim == 3 then
+        _bVol = (4.0/3.0)*math.pi*ball.radius(bp)*ball.radius(bp)*ball.radius(bp)
+      else ; 2D model
+        _bVol = math.pi*ball.radius(bp)*ball.radius(bp)
+      end_if
+      _Vg = _Vg + _bVol
+    end_loop
+    loop foreach cp clump.list
+      local _cVol = clump.vol(cp)
+      _Vg = _Vg + _cVol
+    end_loop
+    ;
+    if _Vg == 0.0 then
+      util.error = '_mpSetGrainDensity: Grain volume sum is zero.'
+    else
+      _rhoG = (cm_densityVal * _mvVolume(true)) / _Vg
+    end_if
+  end_if
+  ;
+  loop foreach bp ball.list
+    ball.density(bp) = _rhoG
+  end_loop
+  loop foreach cp clump.list
+    clump.density(cp) = _rhoG
+  end_loop
+end
+;------------------------------------------------
+def _mpCheckAllParams
+  _mpCheckCommonParams
+  _mpCheckPackingParams
+  case_of cm_matType
+      util.error = 'cm_matType is not [0,4].'
+    case 0
+      _mpCheckLinParams
+    case 1
+      _mpCheckCBParams
+    case 2
+      _mpCheckPBParams
+    case 3
+      _mpCheckFJParams
+    case 4
+      udm_checkParams
+  end_case
+end
+;------------------------------------------------
+def _mpCheckCommonParams
+  if type(cm_matName) # 3 then
+    util.error = 'cm_matName is not a string.'
+  else
+    if cm_matName == '' then
+      cm_matName = 'PFCmat'
+    end_if
+  end_if
+  ;
+  case_of cm_matType
+      util.error = 'cm_matType is not [0,4].'
+    case 0
+    case 1
+    case 2
+    case 3
+    case 4
+  end_case
+  ;
+  if cm_matType == 4 then ; user-defined material
+    if type(cm_modName) # 3 then
+      util.error = 'cm_modName is not a string.'
+    else
+      if cm_modName == '' then
+        util.error = 'cm_modName must be specified.'
+      end_if
+    end_if
+  end_if
+  ;
+  if cm_localDampFac == 0 then ; default
+    cm_localDampFac = float(0.0)
+  else
+    if cm_localDampFac < 0.0 then
+      util.error = 'cm_localDampFac must be in range [0.0, 0.7].'
+    end_if
+    if cm_localDampFac > 0.7 then
+      util.error = 'cm_localDampFac must be in range [0.0, 0.7].'
+    end_if
+  end_if
+  ;
+  if cm_densityCode # 0 then
+    if cm_densityCode # 1 then
+      util.error = 'cm_densityCode must be {0,1}.'
+    end_if
+  end_if
+  if cm_densityVal == 0 then ; default
+    util.error = 'cm_densityVal must be specified.'
+  else
+    if cm_densityVal <= 0.0 then
+      util.error = 'cm_densityVal must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  ; **** Grain shape & size distribution group:
+  case_of cm_shape
+      util.error = 'cm_shape is not {0,1}.'
+    case 0
+      ; empty
+    case 1
+ ;     util.error = 'Grain shape of all clumps is not yet implemented.'
+  end_case
+  ;
+  if cm_nSD == 0 then ; default
+    cm_nSD = 1
+  else
+    if cm_nSD < 1 then
+      util.error = 'cm_nSD must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  local i
+  local Vfrac = 0.0
+  loop for( i=1, i<=cm_nSD, i=i+1 )
+    if cm_typeSD(i) # 0 then
+      if cm_typeSD(i) # 1 then
+        util.error = 'cm_typeSD(' + string(i) + ') must be {0,1}.'
+      end_if
+    end_if
+    ;
+    if cm_shape == 1 then
+      if type( cm_ctName(i) ) # 3 then ; it is not a string
+        util.error = 'cm_ctName(' + string(i) + ') must be specified.'
+      end_if
+    end_if
+    ;
+    if cm_Dlo(i) == 0 then ; default
+      util.error = 'cm_Dlo(' + string(i) + ') must be specified.'
+    else
+      if cm_Dlo(i) <= 0.0 then
+        util.error = 'cm_Dlo(' + string(i) + ') must be greater than zero.'
+      end_if
+    end_if
+    ;
+    if cm_Dup(i) == 0 then ; default
+      util.error = 'cm_Dup(' + string(i) + ') must be specified.'
+    else
+      if cm_Dup(i) <= 0.0 then
+        util.error = 'cm_Dup(' + string(i) + ') must be greater than zero.'
+      end_if
+    end_if
+    if cm_Dup(i) < cm_Dlo(i) then
+      util.error = 'cm_Dup(' + string(i) + ') must be >= cm_Dlo(' + string(i) + ').'
+    end_if
+    ;
+    if cm_Vfrac(i) == 0 then ; default
+      util.error = 'cm_Vfrac(' + string(i) + ') must be specified and cannot be zero.'
+    else
+      if cm_Vfrac(i) <= 0.0 then
+        util.error = 'cm_Vfrac(' + string(i) + ') must be greater than zero.'
+      end_if
+    end_if
+    Vfrac = Vfrac + cm_Vfrac(i)
+  end_loop
+  if math.abs(Vfrac - 1.0) > _ftCheckZeroTol then
+    util.error = 'cm_Vfrac() = ' + string(Vfrac) + ', which does not sum to one.'
+  end_if
+  ;
+  if cm_Dmult == 0 then ; default
+    cm_Dmult = 1.0
+  else
+    if cm_Dmult <= 0.0 then
+      util.error = 'cm_Dmult must be greater than zero.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _mpCheckPackingParams
+  pk_seed = int(pk_seed)
+  if pk_seed == 0 then ; default
+    pk_seed = 10000
+  else
+    if pk_seed < 10000 then
+      util.error = 'pk_seed must be greater than or equal to 10000.'
+    end_if
+  end_if
+  ;
+  if pk_Pm == 0 then ; default
+    util.error = 'pk_Pm must be specified.'
+  else
+    if pk_Pm <= 0.0 then
+      util.error = 'pk_Pm must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pk_PTol == 0 then ; default
+    pk_PTol = 1e-2
+  else
+    if pk_PTol <= 0.0 then
+      util.error = 'pk_PTol must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pk_ARatLimit == 0 then ; default
+    pk_ARatLimit = 8e-3
+  else
+    if pk_ARatLimit <= 0.0 then
+      util.error = 'pk_ARatLimit must be greater than zero.'
+    end_if
+  end_if
+  ;
+  if pk_stepLimit == 0 then ; default
+    pk_stepLimit = 2000000 ; 2 million
+  else
+    if pk_stepLimit < 1 then
+      util.error = 'pk_stepLimit must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  if pk_procCode # 0 then
+    if pk_procCode # 1 then
+      util.error = 'pk_procCode must be {0,1}.'
+    end_if
+  end_if
+  ;
+  if pk_nc == 0 then ; default
+    if global.dim == 3 then
+      if pk_procCode == 0 then
+        pk_nc = 0.58
+      else ; mp_procCode = 1
+        pk_nc = 0.35
+      end_if
+    else ; 2D model
+      if pk_procCode == 0 then
+        pk_nc = 0.25
+      else ; mp_procCode = 1
+        pk_nc = 0.08
+      end_if
+    end_if
+  end_if
+  if pk_nc <= 0.0 then
+    util.error = 'pk_nc must be greater than zero.'
+  end_if
+  if pk_nc >= 1.0 then
+    util.error = 'pk_nc must be less than one.'
+  end_if
+  ;
+  if pk_procCode == 0 then
+    if pk_fricCA == 0 then ; default
+      pk_fricCA = float(0.0)
+    else
+      if pk_fricCA < 0.0 then
+        util.error = 'pk_fricCA must be greater than or equal to zero.'
+      end_if
+    end_if
+    ;
+    if pk_vLimit == 0 then ; default
+      util.error = 'Must specify pk_vLimit.'
+    else
+      if pk_vLimit <= 0.0 then
+        util.error = 'pk_vLimit must be greater than zero.'
+      end_if
+    end_if
+  end_if
+  ;
+  if _pkORmaxLimit == 0 then ; default
+    _pkORmaxLimit = 0.25
+  else
+    if _pkORmaxLimit <= 0.0 then
+      util.error = '_pkORmaxLimit must be greater than or equal to zero.'
+    end_if
+    if _pkORmaxLimit > 2.0 then
+      util.error = '_pkORmaxLimit must be less than or equal to two.'
+    end_if
+  end_if
+  ;
+  if _pkORupdateRate == 0 then ; default
+    _pkORupdateRate = 100
+  else
+    if _pkORupdateRate < 1 then
+      util.error = '_pkORupdateRate must be greater than or equal to one.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _mpCheckLinParams
+  if lnm_emod == 0 then ; default
+    lnm_emod = float(0.0)
+  else
+    if lnm_emod < 0.0 then
+      util.error = 'lnm_emod must be greater than or equal to zero.'
+    end_if
+  end_if
+  if lnm_krat == 0 then  ; default
+    lnm_krat = float(0.0)
+  else
+    if lnm_krat < 0.0 then
+      util.error = 'lnm_krat must be greater than or equal to zero.'
+    end_if
+  end_if
+  if lnm_fric == 0 then  ; default
+    lnm_fric = float(0.0)
+  else
+    if lnm_fric < 0.0 then
+      util.error = 'lnm_fric must be greater than or equal to zero.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _mpCheckPBParams
+  ; Parallel-bonded material group: Linear group:
+  if pbm_emod == 0 then ; default
+    pbm_emod = float(0.0)
+  else
+    if pbm_emod < 0.0 then
+      util.error = 'pbm_emod must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_krat == 0 then ; default
+    pbm_krat = float(0.0)
+  else
+    if pbm_krat < 0.0 then
+      util.error = 'pbm_krat must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_fric == 0 then ; default
+    pbm_fric = float(0.0)
+  else
+    if pbm_fric < 0.0 then
+      util.error = 'pbm_fric must be greater than or equal to zero.'
+    end_if
+  end_if
+  ; **********************
+  ; Parallel-bonded material group: Parallel-bond group:
+  if pbm_igap == 0 then ; default
+    pbm_igap = float(0.0)
+  else
+    if pbm_igap < 0.0 then
+      util.error = 'pbm_igap must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_rmul == 0 then ; default
+    pbm_rmul = float(1.0)
+  else
+    if pbm_rmul <= 0.0 then
+      util.error = 'pbm_rmul must be greater than zero.'
+    end_if
+  end_if
+  ;
+  if pbm_bemod == 0 then ; default
+    pbm_bemod = float(0.0)
+  else
+    if pbm_bemod < 0.0 then
+      util.error = 'pbm_bemod must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_bkrat == 0 then ; default
+    pbm_bkrat = float(0.0)
+  else
+    if pbm_bkrat < 0.0 then
+      util.error = 'pbm_bkrat must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_mcf == 0 then ; default
+    pbm_mcf = float(0.0)
+  else
+    if pbm_mcf < 0.0 then
+      util.error = 'pbm_mcf must be greater than or equal to zero, in range [0.0,  1.0].'
+    end_if
+    if pbm_mcf > 1.0 then
+      util.error = 'pbm_mcf must be less than or equal to one, in range [0.0,  1.0].'
+    end_if
+  end_if
+  ;
+  if pbm_ten_m == 0 then ; default
+    pbm_ten_m = float(0.0)
+  else
+    if pbm_ten_m < 0.0 then
+      util.error = 'pbm_ten_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_ten_sd == 0 then ; default
+    pbm_ten_sd = float(0.0)
+  else
+    if pbm_ten_sd < 0.0 then
+      util.error = 'pbm_ten_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_coh_m == 0 then ; default
+    pbm_coh_m = float(0.0)
+  else
+    if pbm_coh_m < 0.0 then
+      util.error = 'pbm_coh_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_coh_sd == 0 then ; default
+    pbm_coh_sd = float(0.0)
+  else
+    if pbm_coh_sd < 0.0 then
+      util.error = 'pbm_coh_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if pbm_fa == 0 then ; default
+    pbm_fa = float(0.0)
+  else
+    if pbm_fa < 0.0 then
+      util.error = 'pbm_fa must be greater than or equal to zero, in range [0.0,  90.0).'
+    end_if
+    if pbm_fa >= 90.0 then
+      util.error = 'pbm_fa must be less than ninety, in range [0.0,  90.0).'
+    end_if
+  end_if
+  ; **********************
+  ; Linear material group:
+  _mpCheckLinParams
+end
+;------------------------------------------------
+def _mpCheckCBParams
+  ; Contact-bonded material group: Linear group:
+  if cbm_emod == 0 then ; default
+    cbm_emod = float(0.0)
+  else
+    if cbm_emod < 0.0 then
+      util.error = 'cbm_emod must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_krat == 0 then ; default
+    cbm_krat = float(0.0)
+  else
+    if cbm_krat < 0.0 then
+      util.error = 'cbm_krat must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_fric == 0 then ; default
+    cbm_fric = float(0.0)
+  else
+    if cbm_fric < 0.0 then
+      util.error = 'cbm_fric must be greater than or equal to zero.'
+    end_if
+  end_if
+  ; **********************
+  ; Contact-bonded material group: Contact-bond group:
+  if cbm_igap == 0 then ; default
+    cbm_igap = float(0.0)
+  else
+    if cbm_igap < 0.0 then
+      util.error = 'cbm_igap must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_tens_m == 0 then ; default
+    cbm_tens_m = float(0.0)
+  else
+    if cbm_tens_m < 0.0 then
+      util.error = 'cbm_tens_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_tens_sd == 0 then ; default
+    cbm_tens_sd = float(0.0)
+  else
+    if cbm_tens_sd < 0.0 then
+      util.error = 'cbm_tens_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_shears_m == 0 then ; default
+    cbm_shears_m = float(0.0)
+  else
+    if cbm_shears_m < 0.0 then
+      util.error = 'cbm_shears_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if cbm_shears_sd == 0 then ; default
+    cbm_shears_sd = float(0.0)
+  else
+    if cbm_shears_sd < 0.0 then
+      util.error = 'cbm_shears_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ; **********************
+  ; Linear material group:
+  _mpCheckLinParams
+end
+;------------------------------------------------
+def _mpCheckFJParams
+  ; **********************
+  ; Flat-jointed material group:
+  if fjm_igap == 0 then ; default
+    fjm_igap = float(0.0)
+  else
+    if fjm_igap < 0.0 then
+      util.error = 'fjm_igap must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_B_frac < 0.0 then
+    util.error = 'fjm_B_frac must be greater than or equal to zero.'
+  else if fjm_B_frac > 1.0 then
+    util.error = 'fjm_B_frac must be less than or equal to one.'
+  end_if
+  if fjm_G_frac < 0.0 then
+    util.error = 'fjm_G_frac must be greater than or equal to zero.'
+  else if fjm_G_frac > 1.0 then
+    util.error = 'fjm_G_frac must be less than or equal to one.'
+  end_if
+  fjm_S_frac = 1.0 - fjm_B_frac - fjm_G_frac
+  if fjm_S_frac < 0.0 then
+    if math.abs(fjm_S_frac) > _ftCheckZeroTol then
+      util.error = 'fjm_S_frac must be greater than or equal to zero.'
+    end_if
+  else if fjm_S_frac > 1.0 then
+    util.error = 'fjm_S_frac must be less than or equal to one.'
+  end_if
+  local fracSum = fjm_B_frac + fjm_G_frac + fjm_S_frac
+  if math.abs( fracSum - 1.0 ) > _ftCheckZeroTol then
+    util.error = 'fjm_{B,G,S}_frac do not sum to one.'
+  end_if
+  ;
+  if fjm_G_m == 0 then ; default
+    fjm_G_m = float(0.0)
+  else
+    if fjm_G_m < 0.0 then
+      util.error = 'fjm_G_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  if fjm_G_sd == 0 then ; default
+    fjm_G_sd = float(0.0)
+  else
+    if fjm_G_sd < 0.0 then
+      util.error = 'fjm_G_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_Nr == 0 then ; default
+    fjm_Nr = 2
+  else
+    if fjm_Nr < 1 then
+      util.error = 'fjm_Nr must be greater than or equal to one.'
+    end_if
+  end_if
+  if global.dim == 3 then
+    if fjm_Nal == 0 then ; default
+      fjm_Nal = 4
+    else
+      if fjm_Nal < 3 then
+        util.error = 'fjm_Nal must be greater than or equal to three.'
+      end_if
+    end_if
+  end_if
+  ;
+  if fjm_rmulCode # 0 then
+    if fjm_rmulCode # 1 then
+      util.error = 'fjm_rmulCode must be {0,1}.'
+    end_if
+  end_if
+  if fjm_rmulVal == 0 then ; default
+    fjm_rmulVal = float(1.0)
+  else
+    if fjm_rmulVal <= 0.0 then
+      util.error = 'fjm_rmulVal must be greater than zero.'
+    end_if
+  end_if
+  if fjm_rmulCode == 1 then
+    util.error = 'fjm_rmulCode = 1 not yet supported.'
+  end_if
+  ;
+  if fjm_emod == 0 then ; default
+    fjm_emod = float(0.0)
+  else
+    if fjm_emod < 0.0 then
+      util.error = 'fjm_emod must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_krat == 0 then ; default
+    fjm_krat = float(0.0)
+  else
+    if fjm_krat < 0.0 then
+      util.error = 'fjm_krat must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_fric == 0 then ; default
+    fjm_fric = float(0.0)
+  else
+    if fjm_fric < 0.0 then
+      util.error = 'fjm_fric must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_ten_m == 0 then ; default
+    fjm_ten_m = float(0.0)
+  else
+    if fjm_ten_m < 0.0 then
+      util.error = 'fjm_ten_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_ten_sd == 0 then ; default
+    fjm_ten_sd = float(0.0)
+  else
+    if fjm_ten_sd < 0.0 then
+      util.error = 'fjm_ten_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_coh_m == 0 then ; default
+    fjm_coh_m = float(0.0)
+  else
+    if fjm_coh_m < 0.0 then
+      util.error = 'fjm_coh_m must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_coh_sd == 0 then ; default
+    fjm_coh_sd = float(0.0)
+  else
+    if fjm_coh_sd < 0.0 then
+      util.error = 'fjm_coh_sd must be greater than or equal to zero.'
+    end_if
+  end_if
+  ;
+  if fjm_fa == 0 then ; default
+    fjm_fa = float(0.0)
+  else
+    if fjm_fa < 0.0 then
+      util.error = 'fjm_fa must be greater than or equal to zero, in range [0.0,  90.0).'
+    end_if
+    if fjm_fa >= 90.0 then
+      util.error = 'fjm_fa must be less than ninety, in range [0.0,  90.0).'
+    end_if
+  end_if
+  ; **********************
+  ; Linear material group:
+  _mpCheckLinParams
+end
+;------------------------------------------------
+def udm_checkParams
+; If cm_matType == 4 then
+;   check parameters of the user-defined material.
+;
+  local myStr =         'The FISH function udm_checkParams must be provided by user'
+        myStr = myStr + ' when cm_matType == 4. This is done by redefining the function.'
+  util.error = myStr
+end
+;------------------------------------------------
+def mpListMicroProps
+  io.out('## Material Microproperties:')
+  ;
+  mpListCommonProps
+  mpListPackingProps
+  case_of cm_matType
+      util.error = 'cm_matType is not [0,4].'
+    case 0
+      mpListLinProps
+    case 1
+      mpListCBProps
+    case 2
+      mpListPBProps
+    case 3
+      mpListFJProps
+    case 4
+      udm_listProps
+  end_case
+end
+;------------------------------------------------
+def mpListCommonProps
+  io.out('   Common group:')
+  ;
+  io.out('     cm_matName (material name): ' + string(cm_matName))
+  local _str = '     cm_matType (material-type code): '+string(cm_matType)
+  case_of cm_matType
+      util.error = 'cm_matType is not [0,4].'
+    case 0
+      _str = _str + ' (linear)'
+    case 1
+      _str = _str + ' (contact-bonded)'
+    case 2
+      _str = _str + ' (parallel-bonded)'
+    case 3
+      _str = _str + ' (flat-jointed)'
+    case 4
+      _str = _str + ' (user-defined)'
+  end_case
+  io.out(_str)
+  if cm_matType == 4 then ; user-defined material
+    io.out('     cm_modName (contact-model name): ' + string(cm_modName))
+  end_if
+  ;
+  io.out('     cm_localDampFac (local-damping factor): ' + string(cm_localDampFac))
+  ;
+  _str = '     cm_densityCode: ' + string(cm_densityCode)
+  if cm_densityCode == 0 then
+    _str = _str + ' (cm_densityVal is grain density)'
+  else ; cm_densityCode = 1
+    _str = _str + ' (cm_densityVal is bulk density)'
+  end_if
+  io.out(_str)
+  io.out('     cm_densityVal: ' + string(cm_densityVal))
+  ;
+  io.out('     Grain shape & size distribution group:')
+  _str = '       cm_shape (grain-shape code): ' + string(cm_shape)
+  case_of cm_shape
+    util.error = 'cm_shape is not {0,1}.'
+    case 0
+      _str = _str + ' (all balls)'
+    case 1
+      _str = _str + ' (all clumps)'
+  end_case
+  io.out(_str)
+  ;
+  io.out('       cm_nSD (number of size distributions): ' + string(cm_nSD))
+  ;
+  local i
+  loop for( i=1, i<=cm_nSD, i=i+1 )
+    _str = '         cm_typeSD('+string(i)+'): '
+    case_of cm_typeSD(i)
+      case 0
+        _str = _str + '0 (uniform)'
+      case 1
+        _str = _str + '1 (gaussian)'
+    end_case
+    io.out(_str)
+    if cm_shape == 1 then
+      io.out('         cm_ctName('+string(i)+'): '+string(cm_ctName(i)))
+    end_if
+    io.out('         cm_Dlo('+string(i)+'): '+string(cm_Dlo(i)))
+    io.out('         cm_Dup('+string(i)+'): '+string(cm_Dup(i)))
+    io.out('         cm_Vfrac('+string(i)+'): '+string(cm_Vfrac(i)))
+    if i < cm_nSD then
+      io.out('           --------------------------')
+    end_if
+  end_loop
+  ;
+  io.out('       cm_Dmult (diameter multiplier): ' + string(cm_Dmult))
+end
+;------------------------------------------------
+def mpListPackingProps
+  io.out('   Packing group:')
+  io.out('     pk_seed (seed of random-number generator): ' + string(pk_seed))
+  io.out('     pk_Pm (material pressure): ' + string(pk_Pm))
+  io.out('     pk_PTol (pressure tolerance): ' + string(pk_PTol))
+  io.out('     pk_ARatLimit (equilibrium-ratio limit): ' + string(pk_ARatLimit))
+  io.out('     pk_stepLimit (step limit): ' + string(pk_stepLimit))
+  ;
+  _str = '     pk_procCode (packing-procedure code): ' + string(pk_procCode)
+  if pk_procCode == 0 then
+    _str = _str + ' (boundary contraction)'
+  else
+    _str = _str + ' (grain scaling)'
+  end_if
+  io.out( _str )
+  ;
+  io.out('     pk_nc (grain-cloud porosity): ' + string(pk_nc))
+  if pk_procCode == 0 then
+    io.out('     Boundary-contraction group:')
+    io.out('       pk_fricCA (material friction coef. during confinement application): '...
+                   + string(pk_fricCA))
+    io.out('       pk_vLimit (servo velocity limit): ' + string(pk_vLimit))
+  end_if
+  ;
+  io.out('     _pkORmaxLimit (overlap-ratio maximum limit): ' + string(_pkORmaxLimit))
+  io.out('     _pkORupdateRate (overlap-ratio update rate, number of cycles): ' + string(_pkORupdateRate))
+end
+;------------------------------------------------
+def mpListLinProps
+  io.out('   Linear material group:')
+  io.out('     lnm_emod (effective modulus): ' + string(lnm_emod))
+  io.out('     lnm_krat (stiffness ratio): ' + string(lnm_krat))
+  io.out('     lnm_fric (friction coefficient): ' + string(lnm_fric))
+end
+;------------------------------------------------
+def mpListPBProps
+  io.out('   Parallel-bonded material group:')
+  io.out('     Linear group:')
+  io.out('       pbm_emod (effective modulus): ' + string(pbm_emod))
+  io.out('       pbm_krat (stiffness ratio): ' + string(pbm_krat))
+  io.out('       pbm_fric (friction coefficient): ' + string(pbm_fric))
+  ;
+  io.out('     Parallel-bond group:')
+  io.out('       pbm_igap (installation gap): ' + string(pbm_igap))
+  io.out('       pbm_rmul (radius multiplier): ' + string(pbm_rmul))
+  io.out('       pbm_bemod (bond effective modulus): ' + string(pbm_bemod))
+  io.out('       pbm_bkrat (bond stiffness ratio): ' + string(pbm_bkrat))
+  io.out('       pbm_mcf (moment-contribution factor): ' + string(pbm_mcf))
+  io.out('       pbm_ten_m  (tensile-strength distribution, mean): ' + string(pbm_ten_m))
+  io.out('       pbm_ten_sd (tensile-strength distribution, standard deviation): ' + string(pbm_ten_sd))
+  io.out('       pbm_coh_m  (cohesion distribution, mean): ' + string(pbm_coh_m))
+  io.out('       pbm_coh_sd (cohesion distribution, standard deviation): ' + string(pbm_coh_sd))
+  io.out('       pbm_fa (friction angle [degrees]): ' + string(pbm_fa))
+  ;
+  mpListLinProps
+end
+;------------------------------------------------
+def mpListCBProps
+  io.out('   Contact-bonded material group:')
+  io.out('     Linear group:')
+  io.out('       cbm_emod (effective modulus): ' + string(cbm_emod))
+  io.out('       cbm_krat (stiffness ratio): ' + string(cbm_krat))
+  io.out('       cbm_fric (friction coefficient): ' + string(cbm_fric))
+  ;
+  io.out('     Contact-bond group:')
+  io.out('       cbm_igap (installation gap): ' + string(cbm_igap))
+  io.out('       cbm_tens_m    (tensile-strength distribution [stress], mean): ' + string(cbm_tens_m))
+  io.out('       cbm_tens_sd   (tensile-strength distribution [stress], standard deviation): ' + string(cbm_tens_sd))
+  io.out('       cbm_shears_m  (shear-strength   distribution [stress], mean): ' + string(cbm_shears_m))
+  io.out('       cbm_shears_sd (shear-strength   distribution [stress], standard deviation): ' + string(cbm_shears_sd))
+  ;
+  mpListLinProps
+end
+;------------------------------------------------
+def mpListFJProps
+  io.out('   Flat-jointed material group:')
+  io.out('     fjm_igap (installation gap): ' + string(fjm_igap))
+  io.out('     fjm_B_frac (bonded fraction): ' + string(fjm_B_frac))
+  io.out('     fjm_G_frac (gapped fraction): ' + string(fjm_G_frac))
+  io.out('     fjm_S_frac (slit fraction, derived): ' + string(fjm_S_frac))
+  io.out('     fjm_G_m  (initial surface-gap distribution, mean): ' + string(fjm_G_m))
+  io.out('     fjm_G_sd (initial surface-gap distribution, standard deviation): ' + string(fjm_G_sd))
+  if global.dim == 3 then
+    io.out('     fjm_Nr  (elements in radial direc.): ' + string(fjm_Nr))
+    io.out('     fjm_Nal (elements in circumferential direc.): ' + string(fjm_Nal))
+  else ; 2D model
+    io.out('     fjm_Nr  (total number of elements): ' + string(fjm_Nr))
+  end_if
+  local myStr = '     fjm_rmulCode (radius-multiplier code): '+string(fjm_rmulCode)
+  if fjm_rmulCode == 0 then
+    myStr = myStr + ' (fixed)'
+  else
+    myStr = myStr + ' (varying)'
+  end_if
+  io.out( myStr )
+  io.out('     fjm_rmulVal  (radius-multiplier value): ' + string(fjm_rmulVal))
+  io.out('     fjm_emod (effective modulus): ' + string(fjm_emod))
+  io.out('     fjm_krat (stiffness ratio): ' + string(fjm_krat))
+  io.out('     fjm_fric (friction coefficient): ' + string(fjm_fric))
+  io.out('     fjm_ten_m  (tensile-strength distribution, mean): ' + string(fjm_ten_m))
+  io.out('     fjm_ten_sd (tensile-strength distribution, standard deviation): ' + string(fjm_ten_sd))
+  io.out('     fjm_coh_m  (cohesion distribution, mean): ' + string(fjm_coh_m))
+  io.out('     fjm_coh_sd (cohesion distribution, standard deviation): ' + string(fjm_coh_sd))
+  io.out('     fjm_fa (friction angle [degrees]): ' + string(fjm_fa))
+  ;
+  mpListLinProps
+end
+;------------------------------------------------
+def udm_ListProps
+; If cm_matType == 4 then
+;   list properties of the user-defined material.
+;
+  local myStr =         'The FISH function udm_listProps must be provided by user'
+        myStr = myStr + ' when cm_matType == 4. This is done by redefining the function.'
+  util.error = myStr
+end
+;------------------------------------------------
+def mpListMicroStrucProps
+  io.out('## Material Microstructural Properties [# is "number of"]:')
+  mpComputeMicroStrucProps
+  ; ********************  
+  io.out('   Grain Size and Packing Information:')
+  io.out('     mp_nGN (# grains): '+string(mp_nGN))
+  io.out('     Grain-size distribution (GSD) via gsdMeasure(numBins) to create table GSD, ')
+  io.out('       which is displayed in view pl-GSD.')
+  io.out('     mp_Davg               (average grain diameter): '+string(mp_Davg))
+  io.out('     mp_D50                ( median grain diameter): '+string(mp_D50))
+  io.out('     mp_PhiVavg (vessel resolution w.r.t. mp_Davg ): '+string(mp_PhiVavg))
+  io.out('     mp_PhiV50  (vessel resolution w.r.t. mp_D50  ): '+string(mp_PhiV50))
+  io.out('     mv_mn (measurement-based porosity): '+string(mv_mn))
+  local myStr = '     mp_ORs (overlap ratios {max, min, avg}): '
+        myStr = myStr + string('{')
+        myStr = myStr + string(mp_ORmax) + string(',')
+        myStr = myStr + string(mp_ORmin) + string(',')
+        myStr = myStr + string(mp_ORavg) + string('}')
+  io.out(myStr)
+  ; ********************  
+  io.out('   Contact Information:')
+  io.out('     mp_nLNc  (# active linear-based             contacts): '+string(mp_nLNc))
+  io.out('     mp_nLNgg (# active linear-based grain-grain contacts): '+string(mp_nLNgg))
+  io.out('     mp_nLNgw (# active linear-based grain-wall  contacts): '+string(mp_nLNgw))
+  ; ********************  
+  if ft_mBonded then ; bonded material
+    io.out('   Bonded-Material Information:')
+    io.out('     mp_CNb (bond coordination number via bcnMeasure): '+string(mp_CNb))
+    io.out('     mp_nCBb  (# contact-bonded  bonds): '+string(mp_nCBb))
+    io.out('     mp_nPBb  (# parallel-bonded bonds): '+string(mp_nPBb))
+    io.out('     mp_nFJc  (# flat-jointed contacts): '+string(mp_nFJc))
+    io.out('     mp_nFJe  (# flat-jointed elements): '+string(mp_nFJe))
+    io.out('     mp_nFJb  (# flat-jointed    bonds): '+string(mp_nFJb))
+    if cm_matType == 3 then ; flat-jointed material
+      io.out('     Initial microstructural types of flat-jointed material:')
+      io.out('       mp_nFJiB (# FJs initially bonded): '+string(mp_nFJiB))
+      io.out('       mp_nFJiG (# FJs initially gapped): '+string(mp_nFJiG))
+      io.out('       mp_nFJiS (# FJs initially   slit): '+string(mp_nFJiS))
+      io.out('       mp_nFJiU (# FJs initially undef.): '+string(mp_nFJiU))
+    end_if
+  end_if
+  ; ********************  
+  if cm_matType == 4 then ; user-defined material
+    io.out('   User-Defined Material Information:')
+    udm_computeMicroStrucProps
+    udm_listMicroStrucProps
+  end_if
+end
+;------------------------------------------------
+def udm_listMicroStrucProps
+; If cm_matType == 4 then
+;   list microstructural properties of the user-defined material.
+;
+  local myStr =         'The FISH function udm_listMicroStrucProps must be provided by user'
+        myStr = myStr + ' when cm_matType == 4. This is done by redefining the function.'
+  util.error = myStr
+end
+;------------------------------------------------
+def mpComputeMicroStrucProps
+; Compute the microstructural properties of the material, store in global variables and
+; in table GSD.
+;
+; OUT: mp_nGN     : number of grains in model, where a grain is a ball or clump
+;      table GSD  : grain size distribution (additional GSD info. in tables GSD-X)
+;      mp_Davg    : average grain diameter (equals -1.0 if problem measuring it)
+;      mp_D50     : median grain diameter (sieve size that 50 percent of the grains can pass through
+;                    and these grains comprise 50 percent of the total mass)
+;      mp_PhiVavg : vessel resolution w.r.t. average grain diameter
+;      mp_PhiV50  : vessel resolution w.r.t. median grain diameter
+;      mp_OR{max,min,avg} : overlap ratios (defined in ft_OverlapRatios)
+;      mp_CNb     : bond coordination number (defined in bcnMeasure)
+;      mp_nLN{c,gg,gw}, nFJc, mp_n{CB,PB,FJ}b, mp_nFJi{B,G,S,U} : see mpListMicroStrucProps
+;
+  if cm_shape == 1 then
+    util.error = 'mpComputeMicroStrucProps does not yet support clumps.'
+  end_if
+  ;
+  mp_nGN = ball.num + clump.num
+  gsdMeasure( 79 ) ; odd number of bins is preferred
+  ;
+  local cntG = 0
+  local sumD = 0.0
+  loop foreach local bp ball.list
+    cntG = cntG + 1
+    sumD = sumD + 2.0*ball.radius(bp)
+  end_loop
+  if cntG # mp_nGN then
+    util.error = 'Logic error in mpComputeMicroStrucProps.'
+  end_if
+  if cntG # 0 then
+    mp_Davg = sumD / float(cntG)
+  else
+    mp_Davg = -1.0
+  end_if
+  ;
+  mp_D50 = gsdGetSizeOfPercentile( 50.0 )
+  ;
+  local _minDim = math.min( mv_H, mv_W )
+  if global.dim == 3 then
+    _minDim = math.min( _minDim, mv_D )
+  end_if
+  mp_PhiVavg = ( _minDim / mp_Davg  )
+  mp_PhiV50  = ( _minDim / mp_D50 )
+  ;
+  ft_OverlapRatios ;{o: mp_OR{max, min, avg}}
+  ;
+  mp_CNb = bcnMeasure
+  ;
+  mp_nLNc = 0
+  mp_nLNgg = 0
+  mp_nLNgw = 0
+  mp_nFJc = 0
+  mp_nCBb = 0
+  mp_nPBb = 0
+  mp_nFJe = 0
+  mp_nFJb = 0
+  mp_nFJiB = 0
+  mp_nFJiG = 0
+  mp_nFJiS = 0
+  mp_nFJiU = 0
+  loop foreach local cp contact.list.all
+    if ft_cLinearBased(cp) then
+      if contact.active(cp) then
+        mp_nLNc = mp_nLNc + 1
+        if ft_cGrainGrain(cp) then
+          mp_nLNgg = mp_nLNgg + 1
+        else ; must be grain-wall contact
+          mp_nLNgw = mp_nLNgw + 1
+        end_if
+      end_if
+    end_if
+    if contact.model(cp) == 'linearcbond' then
+      if contact.prop(cp, 'cb_state') == 3 then
+        mp_nCBb = mp_nCBb + 1
+      end_if
+    else if contact.model(cp) == 'linearpbond' then
+      if contact.prop(cp, 'pb_state') == 3 then
+        mp_nPBb = mp_nPBb + 1
+      end_if
+    else if contact.model(cp) == 'flatjoint' then
+      mp_nFJc = mp_nFJc + 1
+      ;
+      local nE
+      if global.dim == 3 then
+        nE = contact.prop(cp, 'fj_nr') * contact.prop(cp, 'fj_nal')
+      else ; 2D model
+        nE = contact.prop(cp, 'fj_nr')
+      end_if
+      mp_nFJe = mp_nFJe + nE
+      loop for ( local e = 1, e <= nE, e = e + 1 )
+        contact.prop(cp, 'fj_elem') = e
+        if contact.prop(cp, 'fj_state') == 3 then
+          mp_nFJb = mp_nFJb + 1
+        end_if
+      end_loop
+      ;
+      if      contact.prop(cp, 'fj_mtype') == 1 then
+        mp_nFJiB = mp_nFJiB + 1
+      else if contact.prop(cp, 'fj_mtype') == 2 then
+        mp_nFJiG = mp_nFJiG + 1
+      else if contact.prop(cp, 'fj_mtype') == 3 then
+        mp_nFJiS = mp_nFJiS + 1
+      else if contact.prop(cp, 'fj_mtype') == 4 then
+        mp_nFJiU = mp_nFJiU + 1
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def udm_computeMicroStrucProps
+; If cm_matType == 4 then
+;   compute the microstructural properties of the user-defined material and store in
+;   global variables.
+;
+  local myStr =         'The FISH function udm_computeMicroStrucProps must be provided by user'
+        myStr = myStr + ' when cm_matType == 4. This is done by redefining the function.'
+  util.error = myStr
+end
+;==================================================================================================
+return
+;EOF: ft.fis

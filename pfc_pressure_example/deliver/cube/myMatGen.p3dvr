@@ -1,0 +1,31 @@
+;fname: myMatGen.p3dvr
+;
+;  IN:  {mv, mp}Params.p3dat
+;  OUT: myMatGen.p3log
+;       Saved States (with corresponding model titles):
+;         <cm_matName>-{matV : specimen in material vessel
+;                       mat  : specimen removed from material vessel (if bonded material)
+;                      }
+;
+;=============================================================================
+set logfile myMatGen.p3log
+set log     on truncate
+set echo    on
+
+;#######################################################
+new
+call ..\fistSrc\ft.fis suppress
+call mvParams.p3dat    suppress
+call mpParams.p3dat    suppress
+
+@mvMake
+@mpMake( 0, [false] )
+@mvListProps
+@mpListMicroProps
+@mpListMicroStrucProps
+;#######################################################
+
+gui project save
+set log off
+return
+;EOF: myMatGen.p3dvr

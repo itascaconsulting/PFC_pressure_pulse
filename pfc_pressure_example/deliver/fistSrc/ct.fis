@@ -1,0 +1,486 @@
+;fname: ct.fis
+;
+; Compression Test support functions.
+;
+;==================================================================================================
+;************************************************
+; Compression-Test Parameters:
+;
+;   ct_testType   : test-type code (0: confined, 1: unconfined, 2: uniaxial strain)
+;   ct_Pc         : confining pressure (Pc > 0 is compression)
+;   ct_eRate      : axial strain rate w.r.t. matVessel height
+;                   (|v| = 0.5 * ct_eRate * H, tt_eRate > 0, v is loadVel, H is spec. height)
+;   ct_loadCode   : loading-phase code (0: single stage, 1: multiple stages)
+;   if ct_loadCode == 0:
+;     ct_loadFac  : load-termination factor for termination criterion:
+;                    |x| <= ct_loadFac*|x|_max, where x = mv_wsd
+;   Servo-control group:
+;     ct_PTol      : pressure tolerance (for mvs_eqP())
+;     ct_ARatLimit : equil-ratio limit (parameter of ft_eq, used by mvs_applyConfinement and
+;                    _ctApplyAxialPressure in ctSeatingPhase)
+;     ct_stepLimit : step limit (parameter of ft_eq)
+;     ct_vLimit    : servo velocity limit (see mvs_vLimit)
+;
+;   Hidden parameter:
+;     _ctExpandFac : expansion factor used during unconfined test to move radial walls away
+;                    from the specimen
+;
+;   Set these parameters in ctSetParams in file ctParams.p{2,3}dat.
+;
+; Compression test (CT) uses the material vessel (polyaxial or cylindrical) and the servomechanism.
+;   Internal parameters:
+;     ct_loadStage : completed load stage {0,1,...}
+;                      (e.g., at end of first load stage, ct_loadStage is one)
+;     ct_wsdMax    : maximum of {absolute value of {mv_wsd}}
+;     ct_wsdMax0   : value of ct_wsdMax at start of loading phase
+;------------------------------------------------
+def _ctCheckParams
+  if mv_shape # 0 then
+    if mv_shape # 1 then
+      util.error = 'mv_shape must be {0,1}.'
+    end_if
+  end_if
+  if ct_testType # 0 then
+    if ct_testType # 1 then
+      if ct_testType # 2 then
+        util.error = 'ct_testType must be {0,1,2}.'
+      end_if
+    end_if
+  end_if
+  if ct_Pc == 0 then ; default
+    util.error = 'ct_Pc must be specified.'
+  else
+    if ct_Pc <= 0.0 then
+      util.error = 'ct_Pc must be greater than zero.'
+    end_if
+  end_if
+  if ct_eRate == 0 then ; default
+    util.error = 'ct_eRate must be specified.'
+  else
+    if ct_eRate <= 0.0 then
+      util.error = 'ct_eRate must be greater than zero.'
+    end_if
+  end_if
+  if ct_loadCode # 0 then
+    if ct_loadCode # 1 then
+      util.error = 'ct_loadCode must be {0,1}.'
+    end_if
+  end_if
+  if ct_loadCode == 0 then
+    if ct_loadFac == 0 then ;default
+      ct_loadFac = 0.9
+    else
+      if ct_loadFac <= 0.0 then
+        util.error = 'ct_loadFac must be greater than zero.'
+      end_if
+    end_if
+  end_if
+  ; Servo-control group:
+  ;
+  if ct_PTol == 0 then ; default
+    ct_PTol = pk_PTol
+  end_if
+  if ct_PTol <= 0.0 then
+    util.error = 'ct_PTol must be greater than or equal to zero.'
+  end_if
+  if ct_ARatLimit == 0 then ; default
+    ct_ARatLimit = 1.0e-5
+  end_if
+  if ct_ARatLimit <= 0.0 then
+    util.error = 'ct_ARatLimit must be greater than zero.'
+  end_if
+  if ct_stepLimit == 0 then ; default
+    ct_stepLimit = pk_stepLimit
+  end_if
+  if ct_stepLimit < 1 then
+    util.error = 'ct_stepLimit must be greater than or equal to one.'
+  end_if
+  if ct_vLimit == 0 then ; default
+    ct_vLimit = 20.0 * (0.5 * ct_eRate * mv_H) ; 20 times static-equil. velocity
+  end_if
+  if ct_vLimit <= 0.0 then
+    util.error = 'ct_vLimit must be greater than zero.'
+  end_if
+  ; Hidden parameter:
+  ;
+  if _ctExpandFac == 0 then ;default
+    _ctExpandFac = 1.3
+  else
+    if _ctExpandFac <= 1.0 then
+      util.error = '_ctExpandFac must be greater than one.'
+    end_if
+  end_if
+end
+;------------------------------------------------
+def ctListProps
+  io.out('## Compression-Test Properties:')
+  ;
+    local myStr = '     Test being performed in '
+    if mv_shape == 0 then
+      myStr = myStr + 'polyaxial cell.'
+    else ; mv_shape == 1
+      myStr = myStr + 'cylindrical cell.'
+    end_if
+  io.out( myStr )
+    myStr = '     ct_testType (test-type code): '+string(ct_testType)
+    if ct_testType == 0 then
+      myStr = myStr + ' (confined)'
+    else if ct_testType == 1
+      myStr = myStr + ' (unconfined, _ctExpandFac: ' + string(_ctExpandFac) + ')'
+    else ; ct_testType = 2
+      myStr = myStr + ' (uniaxial strain)'
+    end_if
+  io.out( myStr )
+  io.out('     ct_Pc (confining pressure): '+string(ct_Pc))
+  io.out('     ct_eRate (axial strain rate, positive value): '+string(ct_eRate))
+    myStr = '     ct_loadCode (loading-phase code): '+string(ct_loadCode)
+    if ct_loadCode == 0 then
+      myStr = myStr + ' (single stage)'
+    else ; ct_loadCode = 1
+      myStr = myStr + ' (multiple stages, specify in function ctPerformStages)'
+    end_if
+  io.out( myStr )
+  if ct_loadCode == 0 then
+    io.out('     ct_loadFac (load-termination factor): '+string(ct_loadFac))
+  end_if
+  io.out('     Servo-control group:')
+  io.out('       ct_PTol (pressure tolerance): '+string(ct_PTol))
+  io.out('       ct_ARatLimit (equilibrium-ratio limit): '+string(ct_ARatLimit))
+  io.out('       ct_stepLimit (step limit): '+string(ct_stepLimit))
+  io.out('       ct_vLimit (servo velocity limit): '+string(ct_vLimit))
+end
+;************************************************
+def ctSeatingPhase
+; Perform seating phase by first zeroing the strains. For a confined test, apply confinement
+; via mvs_applyConfinement. For an unconfined test, move radial walls away from the specimen
+; (until they have moved apart a distance of {_ctExpandFac * mv_W}). For both unconfined
+; and uniaxial-strain tests, set and lock radial wall velocities to zero, and then
+; apply axial stress via _ctApplyAxialPressure. Seating is successful if either
+; mvs_applyConfinement or _ctApplyAxialPressure do not throw an error.
+;
+; IN:  ct_testType, ct_Pc, ct_vLimit, ct_PTol, ct_ARatLimit, ct_stepLimit (defined above)
+;      mv_W, _ctExpandFac
+; OUT: Saved State (with corresponding model title):
+;        <cm_matName>-ct0 : end of load stage 0 (seating phase completed)
+;
+  io.out('## ctSeatingPhase (entering).')
+  ct_loadStage = -1
+  ft_SetTitle( _ctMatTestStr + ', performing seating phase (load stage 0). . .' )
+  ;
+  mvs_vLimit = ct_vLimit
+  mvs_on
+  mv_mStrainZero
+  mv_wStrainZero
+  if ct_testType == 0 then
+    mvs_applyConfinement( ct_Pc, ct_PTol, ct_ARatLimit, ct_stepLimit )
+  else if ct_testType == 1 then
+    mv_wAreaMode = 1
+    local vLimit = mvs_vLimit
+      mvs_vLimit = 1.0e20
+      _ctApplyRadialStrain( _ctExpandFac-1.0, 10000.0*ct_eRate )
+    mvs_vLimit = vLimit
+    _ctApplyAxialPressure( ct_Pc, ct_PTol, ct_ARatLimit, ct_stepLimit )
+  else ; ct_TestType = 2
+    _ctApplyAxialPressure( ct_Pc, ct_PTol, ct_ARatLimit, ct_stepLimit )
+  end_if
+  _ctEndStage
+  io.out('## ctSeatingPhase (exiting).')
+end
+;------------------------------------------------
+def ctLoadingPhase
+; Perform loading phase by first zeroing the strains, and then applying axial strain while
+; maintaining appropriate radial-wall boundary conditions.
+;
+; IN:  ct_eRate
+; OUT: Saved States (with corresponding model titles):
+;        <cm_matName>-ctN : end of loading stage N, N = {1,2,...}
+;
+  io.out('## ctLoadingPhase (entering).')
+  mv_mStrainZero
+  mv_wStrainZero
+  if ct_loadCode == 0 then
+    _ctPerformStage( 1, -1.0 )  ; second param. specified axial-strain direc. only
+  else
+    ctPerformStages ; provided by user, in ctParams.p{2,3}dat
+  end_if
+  io.out('## ctLoadingPhase (exiting).')
+end
+;------------------------------------------------
+def ctPerformStages
+; If ct_loadCode == 1 then
+;   specify axial-strain increments for each loading stage via repeated calls to
+;   function _ctPerformStage, which has parameters:
+;     loadStage (loading stage to perform [1,2,...]), and
+;     e_incr    (axial strain increment [e_incr > 0 is opening]).
+; For example, to perform two stages:
+;   _ctPerformStage( 1, -0.008 ) ; -0.8% axial strain
+;   _ctPerformStage( 2,  0.005 ) ; +0.5% axial strain
+;
+  local myStr =         'The FISH function ctPerformStages must be provided by user'
+        myStr = myStr + ' when ct_loadCode == 1. This may be done by redefining the function'
+        myStr = myStr + ' in ctParams.p{2,3}dat.'
+  util.error = myStr
+end
+;------------------------------------------------
+def _ctPerformStage( loadStage, e_incr )
+; Perform specified loading stage.
+; Confirm that each load stage is being performed in consecutive order.
+; PARAMS:
+;   loadStage : loading stage to perform (1,2,...)
+;   e_incr    : axial strain increment (e_incr > 0 is opening)
+;
+  if loadStage # (ct_loadStage + 1) then
+    local myStr = '_ctPerformStage: Must specify load stages in consecutive order,'
+          myStr = myStr + ' completed load stage: '+string(ct_loadStage)
+          myStr = myStr + ', specified load stage: '+string(loadStage)+'.'
+    util.error = myStr
+  end_if
+  ft_SetTitle( _ctMatTestStr + ', performing load stage ' + string(loadStage) + '. . .' )
+  _ctApplyAxialStrain( e_incr )
+  _ctEndStage
+end
+;------------------------------------------------
+def _ctEndStage
+; IN/OUT: ct_loadStage
+  ct_loadStage = ct_loadStage + 1
+  ft_SetTitle( _ctMatTestStr + ', end of load stage ' + string(ct_loadStage) + '.' )
+  ;
+  if ckInited then
+    ckForceUpdate
+  end_if
+  msForceUpdate
+  ft_SaveState( cm_matName, 'ct' + string(ct_loadStage) )
+end
+;------------------------------------------------
+def _ctMatTestStr
+  _ctMatTestStr = cm_matName + ' material, ' + _ctTestStr
+end
+;------------------------------------------------
+def _ctTestStr
+  local str = 'Compression test'
+  if ct_testType == 0 then
+    str = str + ' (confined, Pc = ' + string(ct_Pc) + ' Pa'
+  else if ct_testType == 1 then
+    str = str + ' (unconfined'
+  else ; ct_testType = 2
+    str = str + ' (uniaxial strain'
+  end_if
+  str = str + ', eRate = ' + string(ct_eRate) + ' s^-1)'
+  _ctTestStr = str
+end
+;------------------------------------------------
+def _ctApplyRadialStrain( e_incr, e_rate )
+; Apply radial strain to the specimen by moving the radial walls (at e_rate) until
+;   the strain increment (e_incr) has been applied.
+; Set radial wall velocities to zero at end of strain application.
+; There is no acceleration stage. The wall-based radial strain is used.
+; PARAMS:
+;   e_incr : defined in _ctPerformStage
+;   e_rate : radial strain rate w.r.t. matVessel width
+;              (e_rate = 2*|v|/{W,D}, e_rate > 0, v is wallVel, {W,D} is spec. {width,depth})
+; IN: mv_W, mv_D
+;
+  io.out('** _ctApplyRadialStrain (entering) with')
+  io.out('     e_incr (radial strain increment, e_incr > 0 is opening): '+string(e_incr))
+  io.out('     e_rate (radial strain rate): '+string(e_rate))
+  ;
+  if global.dim == 2 then
+    mvs_BCx = 0
+    mvs_BCxVal = math.sgn(e_incr) * (0.5 * e_rate * mv_W)
+    mvs_BCy = 0
+    mvs_BCyVal = 0.0
+  else ; global.dim == 3
+    if mv_shape == 0 then
+      mvs_BCx = 0
+      mvs_BCxVal = math.sgn(e_incr) * (0.5 * e_rate * mv_D)
+      mvs_BCy = 0
+      mvs_BCyVal = math.sgn(e_incr) * (0.5 * e_rate * mv_W)
+      mvs_BCz = 0
+      mvs_BCzVal = 0.0
+    else
+      mvs_BCz = 0
+      mvs_BCzVal = 0.0
+      mvs_BCr = 0
+      mvs_BCrVal = math.sgn(e_incr) * (0.5 * e_rate * mv_W)
+    end_if
+  end_if
+  mvs_setBCs
+  ;
+  if mv_shape == 1 then
+    _aRSwer0  = mv_wer
+  else
+    _aRSwex0  = mv_wex
+  end_if
+  _aRSeincr = e_incr
+  command
+    solve fishhalt _aRSdone ;{i: {mv_wex or mv_wer}, {_aRSwex0 or _aRSwer0}, _aRSeincr}
+  end_command
+  ;
+  if global.dim == 2 then
+    mvs_BCxVal = 0.0
+  else ; global.dim == 3
+    if mv_shape == 0 then
+      mvs_BCxVal = 0.0
+      mvs_BCyVal = 0.0
+    else
+      mvs_BCrVal = 0.0
+    end_if
+  end_if
+  mvs_setBCs
+  io.out('** _ctApplyRadialStrain (exiting).')
+end
+;------------------------------------------------
+def _aRSdone ;{i: {mv_wex or mv_wer}, {_aRSwex0 or _aRSwer0}, _aRSeincr}
+  if mv_shape == 1 then
+    if math.abs( mv_wer - _aRSwer0 ) >= math.abs(_aRSeincr) then
+      _aRSdone = 1
+    else
+      _aRSdone = 0
+    end_if
+  else
+    if math.abs( mv_wex - _aRSwex0 ) >= math.abs(_aRSeincr) then
+      _aRSdone = 1
+    else
+      _aRSdone = 0
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _ctApplyAxialStrain( e_incr )
+; Apply axial strain to the specimen by moving the axial walls (at ct_eRate) until either:
+;   the load-termination criterion is met (ct_loadCode = 0, ct_loadFac used) or
+;   the strain increment has been applied (ct_loadCode = 1, e_incr used).
+; Set axial wall velocities to zero at end of strain application.
+; There is no acceleration stage. The wall-based axial strain is used.
+; PARAMS:
+;   e_incr    : defined in _ctPerformStage
+; IN: ct_eRate, ct_loadCode, ct_loadFac
+;     mv_H
+;
+  io.out('** _ctApplyAxialStrain (entering) with')
+  io.out('     ct_loadCode = '+string(ct_loadCode))
+  if ct_loadCode == 0 then
+    io.out('     ct_loadFac (load-termination factor): '+string(ct_loadFac))
+  else ; ct_loadCode = 1
+    io.out('     e_incr (axial strain increment, e_incr > 0 is opening): '+string(e_incr))
+  end_if
+  ;
+  if global.dim == 3 then
+    mvs_BCz = 0
+    mvs_BCzVal = math.sgn(e_incr) * (0.5 * ct_eRate * mv_H)
+  else ; 2D model
+    mvs_BCy = 0
+    mvs_BCyVal = math.sgn(e_incr) * (0.5 * ct_eRate * mv_H)
+  end_if
+  mvs_setBCs
+  ;
+  if ct_loadCode == 0 then
+    ct_wsdMax = -1.0e20
+    _ctUpdate_wsdMax
+    ct_wsdMax0 = ct_wsdMax
+    command
+      set fish callback 42.11        _ctUpdate_wsdMax ; after update of mv_wStress
+      solve fishhalt _aASTPPdone0 ;{i: mv_wsd, ct_wsdMax0}
+      solve fishhalt _aASTPPdone  ;{i: mv_wsd, ct_loadFac, ct_wsdMax}
+      set fish callback 42.11 remove _ctUpdate_wsdMax
+    end_command
+  else ; ct_loadCode = 1
+    _aASwea0  = mv_wea
+    _aASeincr = e_incr
+    command
+      solve fishhalt _aASdone ;{i: mv_wea, _aASwea0, _aASeincr}
+    end_command
+  end_if
+  ;
+  if global.dim == 3 then
+    mvs_BCzVal = 0.0
+  else ; 2D model
+    mvs_BCyVal = 0.0
+  end_if
+  mvs_setBCs
+  io.out('** _ctApplyAxialStrain (exiting).')
+end
+;------------------------------------------------
+def _aASdone ;{i: mv_wea, _aASwea0, _aASeincr}
+  if math.abs( mv_wea - _aASwea0 ) >= math.abs(_aASeincr) then
+    _aASdone = 1
+  else
+    _aASdone = 0
+  end_if
+end
+;------------------------------------------------
+def _ctUpdate_wsdMax
+  ct_wsdMax = math.max( math.abs(mv_wsd), ct_wsdMax )
+end
+;------------------------------------------------
+def _aASTPPdone ;{i: mv_wsd, ct_loadFac, ct_wsdMax}
+  if math.abs( mv_wsd ) <= (ct_loadFac * ct_wsdMax) then
+    _aASTPPdone = 1
+  else
+    _aASTPPdone = 0
+  end_if
+end
+;------------------------------------------------
+def _aASTPPdone0 ;{i: mv_wsd, ct_wsdMax0}
+  if math.abs( mv_wsd ) > 5.0*ct_wsdMax0 then
+    _aASTPPdone0 = 1
+  else
+    _aASTPPdone0 = 0
+  end_if
+end
+;------------------------------------------------
+def _ctApplyAxialPressure( Pa, eqPTol, ARatLimit, StepLimit )
+; Attempt to seat the specimen by activating the servomechanism with a pressure boundary condition
+; in the axial direction and a velocity boundary condition of zero in the radial direction.
+; Axial-stress application is successful if both mvs_eqP and ft_eq indicate that static
+; equilibrium has been obtained. If axial-pressure application fails, then throw an error.
+;
+; PARAMS:
+;   Pa        : axial pressure (Pa > 0 is compression)
+;   eqPTol    : equil-pressure tolerance
+;   ARatLimit : equil-ratio limit
+;   StepLimit : step limit
+;
+  local myStr = '** _ctApplyAxialPressure (entering with parameters:'
+  myStr = myStr + ' Pa: '+string(Pa)+','
+  myStr = myStr + ' eqPTol: '+string(eqPTol)+','
+  myStr = myStr + ' ARatLimit: '+string(ARatLimit)+','
+  myStr = myStr + ' StepLimit: '+string(StepLimit)+')'
+  io.out( myStr )
+
+  if global.dim == 2 then
+    mvs_BCx = 0
+    mvs_BCxVal = 0.0
+    mvs_BCy = 1
+    mvs_BCyVal = Pa
+  else ; global.dim == 3
+    if mv_shape == 0 then
+      mvs_BCx = 0
+      mvs_BCxVal = 0.0
+      mvs_BCy = 0
+      mvs_BCyVal = 0.0
+      mvs_BCz = 1
+      mvs_BCzVal = Pa
+    else
+      mvs_BCz = 1
+      mvs_BCzVal = Pa
+      mvs_BCr = 0
+      mvs_BCrVal = 0.0
+    end_if
+  end_if
+  mvs_setBCs
+
+  local retCode
+  retCode = mvs_eqP( eqPTol, StepLimit )
+  if retCode # 0 then
+    util.error = 'Axial-pressure application failed: did not reach equil-pressure tolerance.'
+  end_if
+
+  retCode = ft_eq( ARatLimit, StepLimit )
+  if retCode # 0 then
+    util.error = 'Axial-pressure application failed: did not reach mech-aratio.'
+  end_if
+  io.out('** _ctApplyAxialPressure, axial-pressure application successful (exiting).')
+end
+return
+;EOF: ct.fis

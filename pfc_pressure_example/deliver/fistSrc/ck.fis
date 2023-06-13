@@ -1,0 +1,488 @@
+;fname: ck.fis
+;
+; CracK monitoring support functions.
+;
+;============================================================================================================
+;************************************************
+; Crack Monitoring Package
+;
+;   Crack data consists of bond breakages, which we denote as cracks. Each crack has: type (parallel bonded,
+;   contact bonded, flat jointed or smooth jointed); failure mode (tensile or shear); geometric information
+;   (size, position, normal direction and gap); step number at which it formed; and orphan indicator.
+;   The numbers of all cracks (partitioned by type and failure mode) are returned by the ck_nX functions.
+;   Crack data is stored as a Discrete Fracture Network (DFN). The DFN plot item supports visualization of
+;   the cracks. Crack filtering occurs by calling the FISH function ckFilter(g), which selects cracks with
+;   a gap less than or equal to g. The ckFilter function can be redefined to provide a user-defined
+;   filtering criterion. The DFN plot item displays cracks by specifying: {Shape: Fracture},
+;   {Color By: Text Val: group (slot 1 or 2, for all or filtered cracks, respectively)}, and
+;   {Color Opt: Colors: select on/off and color for each type and failure mode}.
+;
+;   Geometric Information:
+;     A crack is a disk for the 3D model and a linear segment of unit-thickness depth for the 2D model.
+;     A crack has a size (defined in the DFN logic as diameter for the 3D model and length for the 2D model),
+;     position, normal direction and gap.
+;     * The size is set at creation and then frozen. The size is set to equal:
+;         CB: 2*{radius of deformability method},
+;         PB: 2*pb_radius,
+;         FJ: 2*{element radius (with same area as element)} (3D model)
+;             element length (2D model)
+;         SJ: 2*sj_radius.
+;     * The position, normal direction and gap are updated to correspond with material motion subsequent to
+;       bond breakage (see _ckUpdate and ckForceUpdate). The position, normal direction and gap of
+;       flat-jointed cracks correspond with that of the associated element on the flat-joint interface,
+;       whereas these quantities of all other cracks are derived from information associated with the two
+;       parent pieces. These quantities are frozen at their last updated values when information required
+;       to update them no longer exists, and such cracks are called orphans. For the case of a flat-jointed
+;       crack, this corresponds with the condition that the contact either no longer exists or is no longer
+;       flat-jointed. For all other cracks, this corresponds with the condition that at least one of the
+;       parent pieces no longer exists.
+;
+;   Global Variables:
+;     ckInited : crack-monitoring package has been initialized (boolean). Use to surround
+;                ck-functions when ck.fis may not have been called into PFC --- e.g.,
+;                {if ckInited then \nl ckForceUpdate \nl end_if}.
+;     ck_nAll, ck_n{CB,PB,FJ,SJ}{t,s} : crack counts
+;     ckUpdateRate                    : crack geometry update rate (number of cycles)
+;                                       The count is stored in _ckUpdateCnt.
+;
+;   Crack Data (stored for each crack):
+;     geometry : size, position and normal direction (stored as DFN data).
+;                DFN attributes: 'diameter'/'length' for 3D/2D, 'position' and 'normal'
+;     group-1  : name indicating type & failure mode ({CB,PB,FJ,SJ}-{ten,shear}Fail)
+;                of all cracks.
+;     group-2  : name indicating type & failure mode ({CB,PB,FJ,SJ}-{ten,shear}Fail_filtered)
+;                of filtered cracks.
+;     extra-1  : if flat-jointed crack, then originating contact; otherwise, parent piece-1 (ball or pebble).
+;     extra-2  : if flat-jointed crack, then originating element; otherwise, parent piece-2 (ball, pebble or facet).
+;     extra-3  : gap
+;     property 'failStep' : step number at which the crack formed
+;     property 'orphan'   : orphan indicator (1: orphaned crack, 0: not an orphaned crack)
+;
+;   Global Functions:
+;     ckInit, ckOn, ckOff, ckForceUpdate, ckListData, ck_nOrphans, ck_nFiltered
+;
+;   Internal variables:
+;     _ckDFN    : pointer to the CrackData-DFN
+;************************************************
+def _ckCodeDependencies
+; Include functions that will only work with either PFC2D or PFC3D, because they contain Fish intrinsics
+; that are specific to each code.
+  if global.dim == 3 then
+    command
+      def _ckSize( myCrk, cp, eNum )
+        dfn.fracture.diameter( myCrk ) = _ckDiam( cp, eNum )
+      end
+    end_command
+  else ; 2D model
+    command
+      def _ckSize( myCrk, cp, eNum )
+        dfn.fracture.len( myCrk ) = _ckDiam( cp, eNum )
+      end
+    end_command
+  end_if
+end
+@_ckCodeDependencies
+;************************************************
+def ckInit
+; Initialize the crack-monitoring package, this function can be called multiple times.
+;
+; OUT: ckInited
+;
+  if ckInited == false then  ; first call to ckInit
+    _ckDFN = dfn.add( 'CrackData' )
+  end_if
+  _ckResetCrackData
+  ckInited = true
+  ckOn
+end
+;------------------------------------------------
+def ckOn
+; Turn on crack monitoring.
+  if ckInited == false then
+    util.error = 'ckOn: Must call ckInit before calling ckOn.'
+  end_if
+  if _ckOn then
+    exit
+  end_if
+  ;
+  if ckUpdateRate == 0 then ; default
+    ckUpdateRate = 500
+  else
+    if ckUpdateRate < 1 then
+      util.error = 'ckUpdateRate must be greater than or equal to one.'
+    end_if
+  end_if
+  ;
+  command
+    set fish callback bond_break _ckBondBreak
+    set fish callback 10.10      _ckUpdate    ; after EOMs
+  end_command
+  ;
+  _ckOn = true
+  ckForceUpdate
+end
+;------------------------------------------------
+def ckOff  ; defined above
+; Turn off crack monitoring.
+  if ckInited == false then
+    util.error = 'ckOff: Must call ckInit before calling ckOff.'
+  end_if
+  if _ckOn == false then
+    exit
+  end_if
+  ;
+  command
+    set fish callback bond_break remove _ckBondBreak
+    set fish callback 10.10      remove _ckUpdate
+  end_command
+  _ckOn = false
+end
+;------------------------------------------------
+def ckListData
+; List crack data (type and failure mode of all cracks).
+  io.out('## Crack Data --- a crack is a bond breakage [# is "number of"]:')
+  if _ckGeomCnt == 0 then
+    io.out('     Geometry (and orphan status) of all cracks IS fully updated.')
+  else
+    io.out('     Geometry (and orphan status) of all cracks IS NOT fully updated.')
+    io.out('       To fully update: @ckForceUpdate.')
+  end_if
+  io.out('     Type and failure mode of all cracks:')
+  io.out('       ck_nAll              (# cracks): '+string(ck_nAll))
+  io.out('       ck_nOrphans (# orphaned cracks): '+string(ck_nOrphans))
+  io.out('         The position and normal direction of an orphaned crack are frozen at their last updated value.')
+  io.out('       ck_nCBt (# contact-bonded  tensile cracks): '+string(ck_nCBt))
+  io.out('       ck_nCBs (# contact-bonded  shear   cracks): '+string(ck_nCBs))
+  io.out('       ck_nPBt (# parallel-bonded tensile cracks): '+string(ck_nPBt))
+  io.out('       ck_nPBs (# parallel-bonded shear   cracks): '+string(ck_nPBs))
+  io.out('       ck_nFJt (# flat-jointed    tensile cracks): '+string(ck_nFJt))
+  io.out('       ck_nFJs (# flat-jointed    shear   cracks): '+string(ck_nFJs))
+  io.out('       ck_nSJt (# smooth-jointed  tensile cracks): '+string(ck_nSJt))
+  io.out('       ck_nSJs (# smooth-jointed  shear   cracks): '+string(ck_nSJs))
+end
+;------------------------------------------------
+def ckForceUpdate
+  if _ckOn then
+    _ckUpdateCnt = ckUpdateRate ; force the update on next line
+    _ckUpdate
+  end_if
+end
+;------------------------------------------------
+def _ckUpdate
+  _ckUpdateCnt = _ckUpdateCnt + 1
+  if _ckUpdateCnt >= ckUpdateRate then
+    loop foreach local myCrk dfn.fracturelist( _ckDFN )
+      _ckGeom( myCrk )
+    end_loop
+    _ckUpdateCnt = 0
+  end_if
+end
+;------------------------------------------------
+def ckFilter( gapIn )
+; Filter cracks by adding selected cracks to the group (slot 2) of the CrackData-DFN.
+; Selection Criterion:
+;   Non-orphan crack with gap less than or equal to gapIn.
+;
+  loop foreach local myCrk dfn.fracturelist( _ckDFN )
+    dfn.fracture.group( myCrk, 2 ) = 'notFiltered'
+    if dfn.fracture.prop( myCrk, 'orphan' ) == 0 then
+      if dfn.fracture.extra( myCrk, 3 ) <= gapIn then
+        dfn.fracture.group( myCrk, 2 ) = dfn.fracture.group( myCrk, 1 ) + '(filtered)'
+      end_if
+    end_if
+  end_loop
+end
+;------------------------------------------------
+def _ckBondBreak( args )
+  local cp = args(1) ; originating contact
+  local failMode     ; failure mode (1/2 : tensile/shear failure)
+  local eNum = 0     ; originating element (for flat-jointed cracks only)
+  ;
+  if      contact.model(cp) == 'linearcbond' then
+    failMode = args(2)
+  else if contact.model(cp) == 'linearpbond' then
+    failMode = args(2)
+  else if contact.model(cp) == 'flatjoint'   then
+    eNum = args(2)
+    failMode = args(3)
+  else if contact.model(cp) == 'smoothjoint' then
+    failMode = args(2)
+  else
+    util.error = 'Bond-break event cannot be handled by crack-monitoring package.'
+  end_if
+  ;
+ _ckAddCrack( cp, failMode, eNum )
+end
+;------------------------------------------------
+def _ckAddCrack( cp, failMode, eNum )
+  _ckCountCrack( cp, failMode )
+  ;
+  local args
+  if global.dim == 3 then
+    args = array.create(5)
+    args(1) = 'disk'              ; fracture type
+    args(2) = vector(0.0,0.0,0.0) ; disk position (set in _ckGeom as fracture.pos)
+    args(3) = 0.0                 ; disk diameter (set in _ckSize as fracture.diameter)
+    args(4) = 0.0                 ; disk dip      (set in _ckGeom as fracture.normal)
+    args(5) = 0.0                 ; disk dipd     (set in _ckGeom as fracture.normal)
+  else ; 2D model
+    args = array.create(4)
+    args(1) = 'vertices'          ; fracture type
+    args(2) = 2                   ; number of vertices (must equal 2)
+      ; The args 3 & 4 store coords. of vertices.
+      ; Cannot simply give (0,0) for both args, so make segment span diagonally across domain.
+      ; Then set in _ckSize as fracture.length, and set in _ckGeom as fracture.pos and fracture.normal.
+    args(3) = vector( domain.min(1), domain.min(2) )
+    args(4) = vector( domain.max(1), domain.max(2) )
+  end_if
+  local myCrk = dfn.addfracture( _ckDFN, args )
+  ;
+  if contact.model(cp) == 'flatjoint' then
+    dfn.fracture.extra( myCrk, 1 ) = cp
+    dfn.fracture.extra( myCrk, 2 ) = eNum
+  else
+    dfn.fracture.extra( myCrk, 1 ) = contact.end1(cp)
+    dfn.fracture.extra( myCrk, 2 ) = contact.end2(cp)
+  end_if
+  dfn.fracture.extra( myCrk, 3 ) = 0.0 ; gap (set in _ckGeom)
+  dfn.fracture.group( myCrk, 1 ) = _ckName( cp, failMode )
+  dfn.fracture.group( myCrk, 2 ) = 'notFiltered'
+  dfn.fracture.prop(  myCrk, 'failStep' ) = global.step
+  _ckSize( myCrk, cp, eNum )
+  _ckGeom( myCrk )
+end
+;------------------------------------------------
+def _ckFlatJointed( myCrk )
+  if      dfn.fracture.group( myCrk, 1 ) == 'FJ-tenFail' then
+    _ckFlatJointed = true
+  else if dfn.fracture.group( myCrk, 1 ) == 'FJ-shearFail' then
+    _ckFlatJointed = true
+  else
+    _ckFlatJointed = false
+  end_if
+end
+;------------------------------------------------
+def _ckName( cp, failMode )
+; If this name is changed, then modify _ckFlatJointed() to correspond with the new name.
+  _ckName = _ckNameType( cp ) + '-' + _ckNameFailMode( failMode ) + 'Fail'
+end
+;------------------------------------------------
+def _ckNameType( cp )
+  if      contact.model(cp) == 'linearcbond' then
+    _ckNameType = 'CB'
+  else if contact.model(cp) == 'linearpbond' then
+    _ckNameType = 'PB'
+  else if contact.model(cp) == 'flatjoint'   then
+    _ckNameType = 'FJ'
+  else if contact.model(cp) == 'smoothjoint' then
+    _ckNameType = 'SJ'
+  end_if
+end
+;------------------------------------------------
+def _ckNameFailMode( failMode )
+  if failMode == 1 then
+    _ckNameFailMode = 'ten'
+  else
+    _ckNameFailMode = 'shear'
+  end_if
+end
+;------------------------------------------------
+def ck_nOrphans
+; Return the number of orphaned cracks.
+  local nOrphans = 0
+  loop foreach local myCrk dfn.fracturelist( _ckDFN )
+    if dfn.fracture.prop( myCrk, 'orphan' ) == 1 then
+      nOrphans = nOrphans + 1
+    end_if
+  end_loop
+  ck_nOrphans = nOrphans
+end
+;------------------------------------------------
+def ck_nFiltered
+; Return the number of filtered cracks.
+  local nFiltered = 0
+  loop foreach local myCrk dfn.fracturelist( _ckDFN )
+    if dfn.fracture.group( myCrk, 2 ) # 'notFiltered' then
+      nFiltered = nFiltered + 1
+    end_if
+  end_loop
+  ck_nFiltered = nFiltered
+end
+;------------------------------------------------
+def _ckGeom( myCrk )
+; Update the position, normal direction and gap (as well as the orphan status) of myCrk.
+  if _ckFlatJointed( myCrk ) then
+    local cp = dfn.fracture.extra( myCrk, 1 )
+    if cp == null then
+      dfn.fracture.prop( myCrk, 'orphan' ) = 1
+      exit  ; geometry is frozen
+    else if contact.model(cp) # 'flatjoint' then
+      dfn.fracture.prop( myCrk, 'orphan' ) = 1
+      exit  ; geometry is frozen
+    end_if
+    dfn.fracture.prop( myCrk, 'orphan' ) = 0
+    ;
+    local eNum = dfn.fracture.extra( myCrk, 2 )
+    contact.prop(cp, 'fj_elem') = eNum
+    dfn.fracture.pos(    myCrk )    = contact.prop(cp, 'fj_cen')
+    dfn.fracture.normal( myCrk )    = contact.normal( cp ) ; FJ interface remains centered on contact plane
+    dfn.fracture.extra(  myCrk, 3 ) = contact.prop(cp, 'fj_egap')
+  else ; This is not a flat-jointed crack.
+    local end1 = dfn.fracture.extra( myCrk, 1 )
+    local end2 = dfn.fracture.extra( myCrk, 2 )
+    if end1 == null then
+      dfn.fracture.prop( myCrk, 'orphan' ) = 1
+      exit  ; geometry is frozen
+    end_if
+    if end2 == null then
+      dfn.fracture.prop( myCrk, 'orphan' ) = 1
+      exit  ; geometry is frozen
+    end_if
+    dfn.fracture.prop( myCrk, 'orphan' ) = 0
+    ;
+    ; Set {b1,p1,b2,p2,f2} based on the type of contact.
+    if type.pointer.id(end1) == ball.typeid then ; end1 is a ball
+      local b1 = end1
+    else                                         ; end1 is a pebble
+      local p1 = end1
+    end_if
+    if      type.pointer.id(end2) == ball.typeid         then ; end2 is a ball
+      local b2 = end2
+    else if type.pointer.id(end2) == clump.pebble.typeid then ; end2 is a pebble
+      local p2 = end2
+    else                                                      ; end2 is a facet
+      local f2 = end2
+    end_if
+    ;
+    ; Compute {_xc, _nc, _gc}, and store at end of this section.
+    local _d, _nc, _gc
+    if _ckGrainGrain( end2 ) then ; grain-grain crack
+      _d = math.mag( ball.pos(b2) - ball.pos(b1) )
+      _gc = _d - ( ball.radius(b1) + ball.radius(b2) )
+      if math.abs(_d) > 1e-6*ball.radius(b1) then
+        _nc = ( ball.pos(b2) - ball.pos(b1) ) / _d
+      else
+        _nc = vector( 0.0, 0.0, 1.0 )
+      end_if
+    else                          ; grain-wall  crack
+      local _xf = wall.facet.pointnear( f2, ball.pos(b1) )
+      _d = math.mag( _xf - ball.pos(b1) )
+      _gc = _d - ball.radius(b1)
+      if math.abs(_d) > 1e-6*ball.radius(b1) then
+        _nc = ( _xf - ball.pos(b1) ) / _d
+      else
+        _nc = vector( 0.0, 0.0, 1.0 )
+      end_if
+    end_if
+    local _xc = ball.pos(b1) + ( ball.radius(b1) + 0.5*_gc )*_nc
+    ;
+    dfn.fracture.pos(    myCrk )    = _xc
+    dfn.fracture.normal( myCrk )    = _nc
+    dfn.fracture.extra(  myCrk, 3 ) = _gc
+  end_if
+end
+;------------------------------------------------
+def _ckGrainGrain( end2 )
+  if      type.pointer.id(end2) == ball.typeid         then ; end2 is a ball
+    _ckGrainGrain = true
+  else if type.pointer.id(end2) == clump.pebble.typeid then ; end2 is a pebble
+    _ckGrainGrain = true
+  else                                                      ; end2 is a facet
+    _ckGrainGrain = false
+  end_if
+end
+;------------------------------------------------
+def _ckDiam( cp, eNum )
+  if      contact.model(cp) == 'linearcbond' then
+    _ckDiam = 2.0 * _ckDeformabilityRadius( cp )
+  else if contact.model(cp) == 'linearpbond' then
+    _ckDiam = 2.0 * contact.prop( cp, 'pb_radius' )
+  else if contact.model(cp) == 'flatjoint'   then
+    if global.dim == 3 then
+      _ckDiam = 2.0 * math.sqrt( contact.prop(cp, 'fj_area') / math.pi )
+    else ; 2D model
+      _ckDiam = contact.prop(cp, 'fj_area') ; A = 2Rt/Nr (element length)
+    end_if
+  else if contact.model(cp) == 'smoothjoint' then
+    _ckDiam = 2.0 * contact.prop( cp, 'sj_radius' )
+  end_if
+end
+;------------------------------------------------
+def _ckDeformabilityRadius( cp )
+; Return radius of deformability method of linear-based models.
+;
+  local b1, b2, p1, p2
+  if      type.pointer.id(cp) == contact.typeid('ball-ball')     then
+    b1 = contact.end1(cp)
+    b2 = contact.end2(cp)
+    _ckDeformabilityRadius = math.min( ball.radius(b1), ball.radius(b2) )
+  else if type.pointer.id(cp) == contact.typeid('ball-pebble')   then
+    b1 = contact.end1(cp)
+    p2 = contact.end2(cp)
+    _ckDeformabilityRadius = math.min( ball.radius(b1), clump.pebble.radius(p2) )
+  else if type.pointer.id(cp) == contact.typeid('pebble-pebble') then
+    p1 = contact.end1(cp)
+    p2 = contact.end2(cp)
+    _ckDeformabilityRadius = math.min( clump.pebble.radius(p1), clump.pebble.radius(p2) )
+  else if type.pointer.id(cp) == contact.typeid('ball-facet')    then
+    b1 = contact.end1(cp)
+    _ckDeformabilityRadius = ball.radius(b1)
+  else if type.pointer.id(cp) == contact.typeid('pebble-facet')  then
+    p1 = contact.end1(cp)
+    _ckDeformabilityRadius = clump.pebble.radius(p1)
+  end_if
+end
+;------------------------------------------------
+def _ckCountCrack( cp, failMode )
+; Update the crack counts.
+;
+  ck_nAll = ck_nAll + 1
+  ;
+  if      contact.model(cp) == 'linearcbond' then
+    if failMode == 1 then
+      ck_nCBt = ck_nCBt + 1
+    else
+      ck_nCBs = ck_nCBs + 1
+    end_if
+  else if contact.model(cp) == 'linearpbond' then
+    if failMode == 1 then
+      ck_nPBt = ck_nPBt + 1
+    else
+      ck_nPBs = ck_nPBs + 1
+    end_if
+  else if contact.model(cp) == 'flatjoint'   then
+    if failMode == 1 then
+      ck_nFJt = ck_nFJt + 1
+    else
+      ck_nFJs = ck_nFJs + 1
+    end_if
+  else if contact.model(cp) == 'smoothjoint' then
+    if failMode == 1 then
+      ck_nSJt = ck_nSJt + 1
+    else
+      ck_nSJs = ck_nSJs + 1
+    end_if
+  end_if
+end
+;------------------------------------------------
+def _ckResetCrackData
+; Reset crack data by: zeroing the global crack variables, and deleting all cracks.
+;
+  ; Zero the crack counts.
+  ck_nAll = 0
+  ck_nPBt = 0
+  ck_nPBs = 0
+  ck_nCBt = 0
+  ck_nCBs = 0
+  ck_nFJt = 0
+  ck_nFJs = 0
+  ck_nSJt = 0
+  ck_nSJs = 0
+  ;
+  ; Delete all cracks.
+  loop foreach local myCrk dfn.fracturelist( _ckDFN )
+    dfn.deletefracture( myCrk )  
+  end_loop
+end
+return
+;EOF: ck.fis

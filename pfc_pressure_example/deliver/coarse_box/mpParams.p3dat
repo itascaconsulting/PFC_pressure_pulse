@@ -1,0 +1,71 @@
+;fname: mpParams.p3dat
+;
+; Specify the material properties:
+;   common, packing and material groups.
+;
+;#####################################################
+def mpSetCommonParams
+; Set common parameters.
+  cm_matName = 'SS_ParallelBonded'
+  ; ** Typical sandstone (parallel-bonded material).
+  cm_matType = 2
+  cm_localDampFac = 0.7
+  cm_densityCode = 1
+  cm_densityVal = 1960.0
+
+  ; Grain shape & size distribution group:
+    cm_nSD = 1
+    cm_typeSD = array.create(cm_nSD)
+    cm_ctName = array.create(cm_nSD)
+    cm_Dlo    = array.create(cm_nSD)
+    cm_Dup    = array.create(cm_nSD)
+    cm_Vfrac  = array.create(cm_nSD)
+    cm_Dlo(  1) = 8e-3
+    cm_Dup(  1) = 9e-3
+    cm_Vfrac(1) = 1.0
+end
+@mpSetCommonParams
+
+def mpSetPackingParams
+; Set packing parameters.
+  pk_Pm = 100.0e3
+  pk_procCode = 1
+  pk_nc = 0.35
+end
+@mpSetPackingParams
+
+;#####################################################
+def mpSetPBParams
+; Set parallel-bonded material parameters.
+  ; Common group (set in mpSetCommonParams)
+  ; Packing group (set in mpSetPackingParams)
+  ; Parallel-bonded material group:
+    ; Linear group:
+      pbm_emod = 1.5e9
+      pbm_krat = 1.5
+      pbm_fric = 0.4
+
+    ; Parallel-bond group:
+      pbm_igap = 0.5e-3
+      pbm_rmul = 1.0
+      pbm_bemod = 1.5e9
+      pbm_bkrat = 1.5
+      pbm_mcf = 1.0
+      pbm_ten_m  = 1.0e6
+      pbm_ten_sd = 0.0
+      pbm_coh_m  = 20.0e6
+      pbm_coh_sd = 0.0
+      pbm_fa = 0.0
+
+  ; Linear material group:
+    lnm_emod = 1.5e9
+    lnm_krat = 1.5
+    lnm_fric = 0.4
+end
+@mpSetPBParams
+
+@_mpCheckAllParams
+@mpListMicroProps
+
+return
+;EOF: mpParams.p3dat

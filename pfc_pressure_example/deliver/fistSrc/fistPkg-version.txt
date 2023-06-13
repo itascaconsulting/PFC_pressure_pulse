@@ -1,0 +1,5 @@
+;fname: fistPkg-version.txt
+
+This is PFC 5.0 FISHTank version 21b.
+
+;fname: fistPkg-version.txt

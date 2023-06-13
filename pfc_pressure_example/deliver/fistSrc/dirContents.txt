@@ -1,0 +1,17 @@
+;fname: dirContents.txt [fistPkgN\ExampleProjects\fistSrc]
+;
+  fistPkg-version.txt
+
+  ck.fis {CracK monitoring support functions}
+  ct.fis {Compression Test support functions}
+  dc.fis {Diametral-Compression test support functions}
+  ft.fis {FishTank support functions}
+  tt.fis {direct-Tension Test support functions}
+
+  User-Defined Material Example:
+    contactmodelmechanical3dhill005_64.dll {hill contact model,
+                                            dynamic link library file}
+    hl.p3fis     {HilL material support functions}
+    udm_hl.p3fis {User-Defined Material redefs. for the hill material}
+;
+;EOF: dirContents.txt

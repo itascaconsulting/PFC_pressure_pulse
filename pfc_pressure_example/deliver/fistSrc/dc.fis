@@ -1,0 +1,398 @@
+;fname: dc.fis
+;
+; Diametral-Compression test support functions.
+;
+;==================================================================================================
+;************************************************
+; Diametral-Compression Test Parameters:
+;
+;   dc_{w,d}      : platen {width, depth}
+;                   [2D model: dc_d is unit-thickness, not used]
+;   dc_emod       : effective modulus of platens (used by linear contact model)
+;   dc_g0         : initial platen gap
+;   dc_eRate      : axial strain rate
+;                   (|v| = 0.5 * dc_eRate * dc_g0, dc_eRate > 0, v is loadVel)
+;   dc_loadCode   : loading-phase code (0: single stage, 1: multiple stages)
+;   if dc_loadCode == 0:
+;     dc_loadFac  : load-termination factor for termination criterion:
+;                    |x| <= dc_loadFac*|x|_max, where x = dc_wfa
+;   Static-equilibrium group:
+;     dc_ARatLimit : equil-ratio limit (parameter of ft_eq)
+;     dc_stepLimit : step limit (parameter of ft_eq)
+;
+;   Set these parameters in dcSetParams in files dcParams.p{2,3}dat.
+;
+;   Internal parameters:
+;     dcWp{0,1} : opposing-wall pointers s.t. {0,1} = {-,+} = {bottom,top}
+;     dc_wfa : wall-based axial force (positive is tension)
+;     dc_wea : wall-based axial strain (positive is extension)
+;     dc_wda : wall-based axial displacement (positive is opening)
+;     dc_loadStage : completed load stage {0,1,...}
+;                      (e.g., at end of first load stage, dc_loadStage is one)
+;     dc_wfaMax    : maximum of {absolute value of {dc_wfa}}
+;     dc_wfaMax0   : value of dc_wfaMax at start of loading phase
+;------------------------------------------------
+def _dcCheckParams
+  if dc_w == 0 then ; default
+    util.error = 'dc_w must be specified.'
+  else
+    if dc_w <= 0.0 then
+      util.error = 'dc_w must be greater than zero.'
+    end_if
+  end_if
+  if global.dim == 3 then
+    if dc_d == 0 then ; default
+      util.error = 'dc_d must be specified.'
+    else
+      if dc_d <= 0.0 then
+        util.error = 'dc_d must be greater than zero.'
+      end_if
+    end_if
+  end_if
+  if dc_emod == 0 then ; default
+    if mv_emod == 0 then ; default
+      util.error = 'dc_emod must be specified.'
+    else
+      dc_emod = mv_emod
+    end_if
+  else
+    if dc_emod <= 0.0 then
+      util.error = 'dc_emod must be greater than zero.'
+    end_if
+  end_if
+  if dc_g0 == 0 then ; default
+    util.error = 'dc_g0 must be specified.'
+  else
+    if dc_g0 <= 0.0 then
+      util.error = 'dc_g0 must be greater than zero.'
+    end_if
+  end_if
+  if dc_eRate == 0 then ; default
+    util.error = 'dc_eRate must be specified.'
+  else
+    if dc_eRate <= 0.0 then
+      util.error = 'dc_eRate must be greater than zero.'
+    end_if
+  end_if
+  if dc_loadCode # 0 then
+    if dc_loadCode # 1 then
+      util.error = 'dc_loadCode must be {0,1}.'
+    end_if
+  end_if
+  if dc_loadCode == 0 then
+    if dc_loadFac == 0 then ;default
+      dc_loadFac = 0.9
+    else
+      if dc_loadFac <= 0.0 then
+        util.error = 'dc_loadFac must be greater than zero.'
+      end_if
+    end_if
+  end_if
+  ; Static-equilibrium group:
+  ;
+  if dc_ARatLimit == 0 then ; default
+    dc_ARatLimit = 1.0e-5
+  end_if
+  if dc_ARatLimit <= 0.0 then
+    util.error = 'dc_ARatLimit must be greater than zero.'
+  end_if
+  if dc_stepLimit == 0 then ; default
+    if pk_stepLimit == 0 then ; default
+      dc_stepLimit = 2000000 ; 2 million
+    else
+      dc_stepLimit = pk_stepLimit
+    end_if
+  end_if
+  if dc_stepLimit < 1 then
+    util.error = 'dc_stepLimit must be greater than or equal to one.'
+  end_if
+end
+;------------------------------------------------
+def dcListProps
+  io.out('## Diametral-Compression Test Properties:')
+  ;
+  io.out('     dc_w (platen width): '+string(dc_w))
+  if global.dim == 3 then
+    io.out('     dc_d (platen depth): '+string(dc_d))
+  else ; 2D model
+    io.out('     dc_d (platen depth, 2D model): 1.0')
+  end_if
+  io.out('     dc_emod (platen effective modulus): '+string(dc_emod))
+  io.out('     dc_g0 (initial platen gap): '+string(dc_g0))
+  io.out('     dc_eRate (axial strain rate, positive value): '+string(dc_eRate))
+    local myStr = '     dc_loadCode (loading-phase code): '+string(dc_loadCode)
+    if dc_loadCode == 0 then
+      myStr = myStr + ' (single stage)'
+    else ; dc_loadCode = 1
+      myStr = myStr + ' (multiple stages, specify in function dcPerformStages)'
+    end_if
+  io.out( myStr )
+  if dc_loadCode == 0 then
+    io.out('     dc_loadFac (load-termination factor): '+string(dc_loadFac))
+  end_if
+  io.out('     Static-equilibrium group:')
+  io.out('       dc_ARatLimit (equilibrium-ratio limit): '+string(dc_ARatLimit))
+  io.out('       dc_stepLimit (step limit): '+string(dc_stepLimit))
+end
+;************************************************
+def dcSetupPhase
+; Perform setup phase by creating the walls (and removing grain-wall overlap),
+; zeroing the axial strain and bringing the system to static equilibrium (while keeping the walls fixed).
+;
+; IN:  dc_{w,d}, dc_emod, dc_g0
+; OUT: Saved State (with corresponding model title):
+;        <cm_matName>-dc0 : end of loading stage 0
+;
+  io.out('## dcSetupPhase (entering).')
+  dc_loadStage = -1
+  ft_SetTitle( _dcMatTestStr + ', performing set-up phase (load stage 0). . .' )
+  ;
+  _dcMakeWalls
+  command
+    clean
+  end_command
+  ft_SmoothGrainWallInterface
+  dc_wInit
+  retCode = ft_eq( dc_ARatLimit, dc_stepLimit )
+  if retCode # 0 then
+    util.error = 'Set-up failed: static equilibrium was not obtained.'
+  end_if
+  ;
+  _dcEndStage
+  io.out('## dcSetupPhase (exiting).')
+end
+;------------------------------------------------
+def dcLoadingPhase
+; Perform loading phase by applying axial strain.
+;
+; IN:  dc_eRate
+; OUT: Saved States (with corresponding model titles):
+;        <cm_matName>-dcN : end of loading stage N, N = {1,2,...}
+;
+  io.out('## dcLoadingPhase (entering).')
+  if dc_loadCode == 0 then
+    _dcPerformStage( 1, -1.0 )  ; second param. specified axial-strain direc. only
+  else
+    dcPerformStages ; provided by user, in dcParams.p{2,3}dat
+  end_if
+  io.out('## dcLoadingPhase (exiting).')
+end
+;------------------------------------------------
+def dcPerformStages
+; If dc_loadCode == 1 then
+;   specify axial-strain increments for each loading stage via repeated calls to
+;   function _dcPerformStage, which has parameters:
+;     loadStage (loading stage to perform [1,2,...]), and
+;     e_incr    (axial strain increment [e_incr > 0 is opening]).
+; For example, to perform two stages:
+;   _dcPerformStage( 1,  0.008 ) ;  0.8% axial strain
+;   _dcPerformStage( 2, -0.005 ) ; -0.5% axial strain
+;
+  local myStr =         'The FISH function dcPerformStages must be provided by user'
+        myStr = myStr + ' when dc_loadCode == 1. This may be done by redefining the function'
+        myStr = myStr + ' in dcParams.p{2,3}dat.'
+  util.error = myStr
+end
+;------------------------------------------------
+def _dcPerformStage( loadStage, e_incr )
+; Perform specified loading stage.
+; Confirm that each load stage is being performed in consecutive order.
+; PARAMS:
+;   loadStage : loading stage to perform (1,2,...)
+;   e_incr    : axial strain increment (e_incr > 0 is opening)
+;
+  if loadStage # (dc_loadStage + 1) then
+    local myStr = '_dcPerformStage: Must specify load stages in consecutive order,'
+          myStr = myStr + ' completed load stage: '+string(dc_loadStage)
+          myStr = myStr + ', specified load stage: '+string(loadStage)+'.'
+    util.error = myStr
+  end_if
+  ft_SetTitle( _dcMatTestStr + ', performing load stage ' + string(loadStage) + '. . .' )
+  _dcApplyAxialStrain( e_incr )
+  _dcEndStage
+end
+;------------------------------------------------
+def _dcEndStage
+; IN/OUT: dc_loadStage
+  dc_loadStage = dc_loadStage + 1
+  ft_SetTitle( _dcMatTestStr + ', end of load stage ' + string(dc_loadStage) + '.' )
+  ;
+  ckForceUpdate
+  msForceUpdate
+  ft_SaveState( cm_matName, 'dc' + string(dc_loadStage) )
+end
+;------------------------------------------------
+def _dcMatTestStr
+  _dcMatTestStr = cm_matName + ' material, ' + _dcTestStr
+end
+;------------------------------------------------
+def _dcTestStr
+  local str = 'Diametral-compression test'
+        str = str + ' (eRate = ' + string(dc_eRate) + ' s^-1)'
+  _dcTestStr = str
+end
+;------------------------------------------------
+def _dcApplyAxialStrain( e_incr )
+; Apply axial strain to the specimen by moving the walls (at dc_eRate) until either:
+;   the load-termination criterion is met (dc_loadCode = 0, dc_loadFac used) or
+;   the strain increment has been applied (dc_loadCode = 1, e_incr used).
+; Set wall velocities to zero at end of strain application.
+; There is no acceleration stage. The wall-based axial strain is used.
+; PARAMS:
+;   e_incr    : defined in _dcPerformStage
+; IN: dc_eRate, dc_loadCode, dc_loadFac
+;     dc_g0
+;
+  io.out('** _dcApplyAxialStrain (entering) with')
+  io.out('     dc_loadCode = '+string(dc_loadCode))
+  if dc_loadCode == 0 then
+    io.out('     dc_loadFac (load-termination factor): '+string(dc_loadFac))
+  else ; dc_loadCode = 1
+    io.out('     e_incr (axial strain increment, e_incr > 0 is opening): '+string(e_incr))
+  end_if
+  ;
+  local AxialVelocity = math.sgn(e_incr) * (0.5 * dc_eRate * dc_g0)
+  _dcSetWallVel( AxialVelocity )
+ ;
+  if dc_loadCode == 0 then
+    dc_wfaMax = -1.0e20
+    _dcUpdate_wfaMax
+    dc_wfaMax0 = dc_wfaMax
+    command
+      set fish callback 42.11        _dcUpdate_wfaMax ; after update of dc_wForce
+      solve fishhalt _aASTPPdone0 ;{i: dc_wfa, dc_wfaMax0}
+      solve fishhalt _aASTPPdone  ;{i: dc_wfa, dc_loadFac, dc_wfaMax}
+      set fish callback 42.11 remove _dcUpdate_wfaMax
+    end_command
+  else ; dc_loadCode = 1
+    _aASwea0  = dc_wea
+    _aASeincr = e_incr
+    command
+      solve fishhalt _aASdone ;{i: dc_wea, _aASwea0, _aASeincr}
+    end_command
+  end_if
+  ;
+  _dcSetWallVel( 0.0 )
+  io.out('** _dcApplyAxialStrain (exiting).')
+end
+;------------------------------------------------
+def _dcSetWallVel( wallVel )
+; Set axial velocity of the walls (with positive gripVel indicating opening motion).
+  wall.vel( dcWp0, 2 ) = -wallVel
+  wall.vel( dcWp1, 2 ) =  wallVel
+end
+;------------------------------------------------
+def _aASdone ;{i: dc_wea, _aASwea0, _aASeincr}
+  if math.abs( dc_wea - _aASwea0 ) >= math.abs(_aASeincr) then
+    _aASdone = 1
+  else
+    _aASdone = 0
+  end_if
+end
+;------------------------------------------------
+def _dcUpdate_wfaMax
+  dc_wfaMax = math.max( math.abs(dc_wfa), dc_wfaMax )
+end
+;------------------------------------------------
+def _aASTPPdone ;{i: dc_wfa, dc_loadFac, dc_wfaMax}
+  if math.abs( dc_wfa ) <= (dc_loadFac * dc_wfaMax) then
+    _aASTPPdone = 1
+  else
+    _aASTPPdone = 0
+  end_if
+end
+;------------------------------------------------
+def _aASTPPdone0 ;{i: dc_wfa, dc_wfaMax0}
+  if math.abs( dc_wfa ) > dc_wfaMax0 then
+    _aASTPPdone0 = 1
+  else
+    _aASTPPdone0 = 0
+  end_if
+end
+;------------------------------------------------
+def dc_wInit
+  _wdy = dc_g0
+  dc_wStrainZero
+  dc_wStrain
+  dc_wForceZero
+  dc_wForce
+  command
+    set fish callback 42.1  dc_wForce  ; after FDLaw (40.1 is not allowed)
+    set fish callback 10.10 dc_wStrain ; after EOMs
+  end_command
+end
+;------------------------------------------------
+def dc_wRemove
+  dc_wStrainZero
+  dc_wForceZero
+  command
+    set fish callback 42.1  remove dc_wForce
+    set fish callback 10.10 remove dc_wStrain
+  end_command
+  wall.delete( dcWp0 )
+  wall.delete( dcWp1 )
+end
+;------------------------------------------------
+def dc_wForceZero
+  dc_wfa = 0.0
+end
+;------------------------------------------------
+def dc_wStrainZero
+  _wdy0 = _wdy
+  dc_wea = 0.0
+end
+;------------------------------------------------
+def dc_wda
+; Return wall-based axial displacement (positive is opening).
+  dc_wda = dc_wea * dc_g0
+end
+;------------------------------------------------
+def dc_wForce
+; Update the wall-based force quantity.
+; IN: dcWp{0,1}
+; OUT: dc_wfa
+;
+  dc_wfa = 0.5*( wall.force.contact(dcWp0, 2) - wall.force.contact(dcWp1, 2) )
+end
+;------------------------------------------------
+def dc_wStrain
+; Update the wall-based strain quantity.
+; IN:  dcWp{0,1}
+; OUT: _wdy
+;      dc_wea
+;
+  _wdy = wall.pos( dcWp1, 2 ) - wall.pos( dcWp0, 2 )
+  dc_wea = (_wdy - _wdy0) / _wdy0
+end
+;------------------------------------------------
+def _dcMakeWalls
+; OUT: dcWp{0,1} : opposing-wall pointers s.t. {0,1} = {-,+} = {bottom,top}
+;
+  ft_setGrainWallBehavior( 'existing', 0.0, dc_emod, 0.0, 0.0, 'linear' )
+  ft_setGrainWallBehavior( 'future',   0.0, dc_emod, 0.0, 0.0, 'linear' )
+  if global.dim == 3 then
+    command
+      wall generate id 1 name dcBottom polygon [vector(-0.5*dc_w, -0.5*dc_g0,  0.5*dc_d)] ...
+                                               [vector( 0.5*dc_w, -0.5*dc_g0,  0.5*dc_d)] ...
+                                               [vector( 0.5*dc_w, -0.5*dc_g0, -0.5*dc_d)] ...
+                                               [vector(-0.5*dc_w, -0.5*dc_g0, -0.5*dc_d)] ...
+                                               makeplanar
+      wall generate id 2 name dcTop    polygon [vector(-0.5*dc_w,  0.5*dc_g0,  0.5*dc_d)] ...
+                                               [vector( 0.5*dc_w,  0.5*dc_g0,  0.5*dc_d)] ...
+                                               [vector( 0.5*dc_w,  0.5*dc_g0, -0.5*dc_d)] ...
+                                               [vector(-0.5*dc_w,  0.5*dc_g0, -0.5*dc_d)] ...
+                                               makeplanar
+    end_command
+  else ; 2D model
+    command
+      wall create id 1 name dcBottom vertices [vector(-0.5*dc_w, -0.5*dc_g0)] ...
+                                              [vector( 0.5*dc_w, -0.5*dc_g0)]
+      wall create id 2 name dcTop    vertices [vector(-0.5*dc_w,  0.5*dc_g0)] ...
+                                              [vector( 0.5*dc_w,  0.5*dc_g0)]
+    end_command
+  end_if
+  dcWp0 = wall.find(1)
+  dcWp1 = wall.find(2)
+end
+return
+;EOF: dc.fis
